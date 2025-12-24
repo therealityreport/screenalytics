@@ -140,6 +140,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Data root override (defaults to SCREENALYTICS_DATA_ROOT or ./data)",
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional pipeline run identifier (generated when omitted).",
+    )
+    parser.add_argument(
         "--progress-file",
         help="Progress JSON file to update during processing",
     )
@@ -171,6 +176,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _finalize_run_exports(ep_id: str, run_id: str) -> None:
+    try:
+        from apps.api.services.run_export import build_and_upload_debug_pdf, run_segments_export
+    except Exception as exc:
+        print(f"[run_pipeline] export imports failed: {exc}", file=sys.stderr)
+        return
+
+    try:
+        build_and_upload_debug_pdf(
+            ep_id=ep_id,
+            run_id=run_id,
+            upload_to_s3=False,
+            write_index=True,
+        )
+    except Exception as exc:
+        print(f"[run_pipeline] run_debug.pdf generation failed: {exc}", file=sys.stderr)
+
+    try:
+        run_segments_export(ep_id=ep_id, run_id=run_id)
+    except Exception as exc:
+        print(f"[run_pipeline] segments.parquet export failed: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     args = parse_args(argv)
@@ -189,6 +217,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Import the engine
     from py_screenalytics.pipeline import run_episode, EpisodeRunConfig
+    from py_screenalytics import run_layout
+
+    raw_run_id = args.run_id
+    run_id_missing = raw_run_id is None or not str(raw_run_id).strip()
+    run_id = run_layout.get_or_create_run_id(args.ep_id, raw_run_id)
+    if run_id_missing:
+        print(f"[run_pipeline] run_id={run_id}", file=sys.stderr)
 
     # Build config
     config = EpisodeRunConfig(
@@ -209,18 +244,26 @@ def main(argv: list[str] | None = None) -> int:
         progress_file=Path(args.progress_file) if args.progress_file else None,
         reuse_detections=args.reuse_detections,
         reuse_embeddings=args.reuse_embeddings,
+        run_id=run_id,
     )
 
     if not args.quiet:
         print(f"[run_pipeline] Starting episode={args.ep_id} device={config.device} stride={config.stride}", file=sys.stderr)
 
-    # Run the pipeline
-    result = run_episode(args.ep_id, video_path, config)
+    result = None
+    try:
+        result = run_episode(args.ep_id, video_path, config)
+    finally:
+        _finalize_run_exports(args.ep_id, run_id)
 
     # Output results
     if args.json:
+        if result is None:
+            return 1
         print(result.to_json())
     else:
+        if result is None:
+            return 1
         if result.success:
             print(f"\n[run_pipeline] ✅ Success!", file=sys.stderr)
             print(f"  Episode:     {result.episode_id}", file=sys.stderr)

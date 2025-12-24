@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from streamlit.runtime.scriptrunner import RerunException, StopException
+try:  # pragma: no cover - optional dependency
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover - optional dependency
+    st_autorefresh = None
 
 LOGGER = logging.getLogger("episode_detail")
 
@@ -29,7 +33,9 @@ import episode_detail_layout as stage_layout  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
 from py_screenalytics import run_layout  # noqa: E402
-from py_screenalytics.episode_status import stage_artifacts  # noqa: E402
+from py_screenalytics.episode_status import read_episode_status, stage_artifacts  # noqa: E402
+from py_screenalytics.run_gates import check_prereqs  # noqa: E402
+from py_screenalytics import run_logs  # noqa: E402
 
 FRAME_JPEG_SIZE_EST_BYTES = 220_000
 CROP_JPEG_SIZE_EST_BYTES = 40_000
@@ -1320,19 +1326,116 @@ def _render_downstream_progress(
         st.warning(stall_msg)
 
 
+def _stage_blocked_details(
+    stage_key: str,
+    stage_status: dict[str, Any] | None,
+    ep_id: str,
+    run_id: str | None,
+) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    actions: list[str] = []
+    blocked_reason = stage_status.get("blocked_reason") if isinstance(stage_status, dict) else None
+    if isinstance(blocked_reason, dict):
+        details = blocked_reason.get("details")
+        if isinstance(details, dict):
+            raw_reasons = details.get("reasons")
+            if isinstance(raw_reasons, list):
+                for entry in raw_reasons:
+                    if not isinstance(entry, dict):
+                        continue
+                    code = entry.get("code")
+                    message = entry.get("message")
+                    if code or message:
+                        reasons.append(f"{code}: {message}" if code else str(message))
+            raw_actions = details.get("suggested_actions")
+            if isinstance(raw_actions, list):
+                actions.extend([str(item) for item in raw_actions if item])
+        if not reasons:
+            code = blocked_reason.get("code")
+            message = blocked_reason.get("message")
+            if code or message:
+                reasons.append(f"{code}: {message}" if code else str(message))
+
+    if run_id and not reasons:
+        try:
+            gate = check_prereqs(stage_key, ep_id, run_id)
+            for reason in gate.reasons:
+                reasons.append(f"{reason.code}: {reason.message}")
+            actions.extend(gate.suggested_actions)
+        except Exception as exc:
+            LOGGER.debug("[gates] Failed to evaluate prereqs for %s: %s", stage_key, exc)
+
+    actions = [action for action in actions if action]
+    return reasons, actions
+
+
+def _render_blocked_callout(
+    stage_key: str,
+    stage_status: dict[str, Any] | None,
+    ep_id: str,
+    run_id: str | None,
+) -> None:
+    reasons, actions = _stage_blocked_details(stage_key, stage_status, ep_id, run_id)
+    if reasons:
+        st.caption("Blocked reasons:")
+        for reason in reasons:
+            st.caption(f"• {reason}")
+    if actions:
+        st.caption("Suggested actions:")
+        for action in actions:
+            st.caption(f"• {action}")
+
+
+def _format_log_entries(entries: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("ts") or ""
+        level = str(entry.get("level") or "INFO").upper()
+        msg = entry.get("msg") or ""
+        meta = entry.get("meta")
+        meta_text = ""
+        if isinstance(meta, dict) and meta:
+            try:
+                meta_text = f" | {json.dumps(meta, sort_keys=True)}"
+            except Exception:
+                meta_text = f" | {meta}"
+        prefix = ""
+        if level == "WARNING":
+            prefix = "⚠️ "
+        elif level == "ERROR":
+            prefix = "❌ "
+        lines.append(f"{prefix}{ts} [{level}] {msg}{meta_text}".strip())
+    return "\n".join(lines)
+
+
 def _render_downstream_log_expander(
     label: str,
     *,
-    marker_payload: dict[str, Any] | None,
+    ep_id: str,
+    stage_key: str,
+    run_id: str | None,
+    status_value: str | None,
     progress_payload: dict[str, Any] | None,
     artifacts_hint: str | None = None,
 ) -> None:
-    with st.expander(f"{label} Detailed Log", expanded=False):
-        if progress_payload:
-            st.code(json.dumps(progress_payload, indent=2), language="json")
+    expanded = str(status_value or "").lower() in {"running", "failed", "error", "blocked"}
+    with st.expander(f"{label} Logs", expanded=expanded):
+        if not run_id:
+            st.caption("Select a run_id to view stage logs.")
             return
-        if marker_payload:
-            st.code(json.dumps(marker_payload, indent=2), language="json")
+        log_entries = run_logs.tail_logs(ep_id, run_id, stage_key, n=200)
+        progress_pct = run_logs.read_stage_progress(ep_id, run_id, stage_key)
+        if progress_pct is None:
+            progress_pct = _progress_pct_from_payload(progress_payload)
+            if progress_pct is not None:
+                progress_pct = progress_pct * 100.0
+        if progress_pct is not None and str(status_value or "").lower() == "running":
+            st.progress(min(max(progress_pct / 100.0, 0.0), 1.0))
+            st.caption(f"Progress: {progress_pct:.1f}%")
+        if log_entries:
+            st.code(_format_log_entries(log_entries), language="text")
             return
         if artifacts_hint:
             st.caption(artifacts_hint)
@@ -1810,15 +1913,17 @@ def _cached_episode_status(
 def _cached_episode_status_file(
     ep_id: str,
     run_id: str | None,
-    status_mtime: float,
+    cache_key: tuple,
 ) -> Dict[str, Any] | None:
     if not run_id:
         return None
     try:
-        run_root = run_layout.run_root(ep_id, run_id)
-    except ValueError:
+        status = read_episode_status(ep_id, run_id)
+    except (ValueError, OSError):
         return None
-    return _read_json_payload(run_root / "episode_status.json")
+    except Exception:
+        return None
+    return status.as_dict()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2532,7 +2637,7 @@ if should_refresh_status:
     st.session_state[status_ts_key] = time.time()
     st.session_state[mtimes_key] = current_mtimes
 status_refreshed_at = st.session_state.get(status_ts_key)
-episode_status_payload = _cached_episode_status_file(ep_id, selected_attempt_run_id, episode_status_mtime)
+episode_status_payload = _cached_episode_status_file(ep_id, selected_attempt_run_id, current_mtimes)
 
 def _phase_from_episode_status(
     status_payload: dict[str, Any] | None,
@@ -2586,6 +2691,54 @@ def _phase_from_episode_status(
                 merged[key] = metrics.get(key)
     return merged
 
+
+def _canonical_stage_entry(
+    status_payload: dict[str, Any] | None,
+    stage_key: str,
+) -> dict[str, Any] | None:
+    if not isinstance(status_payload, dict):
+        return None
+    stages = status_payload.get("stages")
+    if not isinstance(stages, dict):
+        return None
+    entry = stages.get(stage_key)
+    return entry if isinstance(entry, dict) else None
+
+
+def _canonical_stage_status(
+    status_payload: dict[str, Any] | None,
+    stage_key: str,
+) -> str | None:
+    entry = _canonical_stage_entry(status_payload, stage_key)
+    if not entry:
+        return None
+    status_value = entry.get("status")
+    if not status_value:
+        return None
+    normalized = str(status_value).strip().lower()
+    if normalized in {"not_started", "missing", "unknown"}:
+        return "missing"
+    if normalized in {"error"}:
+        return "failed"
+    return normalized
+
+
+def _canonical_stage_error(entry: dict[str, Any] | None) -> str | None:
+    if not entry:
+        return None
+    error_reason = entry.get("error_reason") or entry.get("error_message")
+    if isinstance(error_reason, str) and error_reason.strip():
+        return error_reason.strip()
+    blocked = entry.get("blocked_reason")
+    if isinstance(blocked, dict):
+        message = blocked.get("message") if isinstance(blocked.get("message"), str) else None
+        code = blocked.get("code") if isinstance(blocked.get("code"), str) else None
+        if message:
+            return message
+        if code:
+            return code
+    return None
+
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
     faces_phase_status: Dict[str, Any] = {"status": "unknown"}
@@ -2601,6 +2754,16 @@ else:
     track_fusion_phase_status = {}
     pdf_phase_status = {}
 
+canonical_stage_entries = {
+    "detect": None,
+    "faces": None,
+    "cluster": None,
+    "body_tracking": None,
+    "track_fusion": None,
+    "pdf": None,
+}
+canonical_statuses = {stage_key: None for stage_key in canonical_stage_entries}
+
 if isinstance(episode_status_payload, dict):
     detect_phase_status = _phase_from_episode_status(episode_status_payload, "detect", detect_phase_status)
     faces_phase_status = _phase_from_episode_status(episode_status_payload, "faces", faces_phase_status)
@@ -2612,6 +2775,19 @@ if isinstance(episode_status_payload, dict):
         episode_status_payload, "track_fusion", track_fusion_phase_status
     )
     pdf_phase_status = _phase_from_episode_status(episode_status_payload, "pdf", pdf_phase_status)
+
+    canonical_stage_entries = {
+        "detect": _canonical_stage_entry(episode_status_payload, "detect"),
+        "faces": _canonical_stage_entry(episode_status_payload, "faces"),
+        "cluster": _canonical_stage_entry(episode_status_payload, "cluster"),
+        "body_tracking": _canonical_stage_entry(episode_status_payload, "body_tracking"),
+        "track_fusion": _canonical_stage_entry(episode_status_payload, "track_fusion"),
+        "pdf": _canonical_stage_entry(episode_status_payload, "pdf"),
+    }
+    canonical_statuses = {
+        stage_key: _canonical_stage_status(episode_status_payload, stage_key)
+        for stage_key in canonical_stage_entries
+    }
 
 api_active_run_id = (status_payload or {}).get("active_run_id")
 if not st.session_state.get(_attempt_init_key) and not selected_attempt:
@@ -2903,19 +3079,33 @@ manifest_state = {
     "tracks_only_fallback": bool(detect_tracks_ready and not detect_detections_ready),
 }
 
+canonical_detect_status = canonical_statuses.get("detect")
+canonical_faces_status = canonical_statuses.get("faces")
+canonical_cluster_status = canonical_statuses.get("cluster")
+canonical_body_tracking_status = canonical_statuses.get("body_tracking")
+canonical_track_fusion_status = canonical_statuses.get("track_fusion")
+canonical_pdf_status = canonical_statuses.get("pdf")
+
+detect_status_authoritative = canonical_detect_status is not None
+faces_status_authoritative = canonical_faces_status is not None
+cluster_status_authoritative = canonical_cluster_status is not None
+body_tracking_status_authoritative = canonical_body_tracking_status is not None
+track_fusion_status_authoritative = canonical_track_fusion_status is not None
+pdf_status_authoritative = canonical_pdf_status is not None
+
 # Get status values from API
-faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
-cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
+faces_status_value = canonical_faces_status or str(faces_phase_status.get("status") or "missing").lower()
+cluster_status_value = canonical_cluster_status or str(cluster_phase_status.get("status") or "missing").lower()
 tracks_ready_flag = bool((status_payload or {}).get("tracks_ready")) or manifest_state["manifest_ready"]
 
 # FIX: Override stale "running" status if job just completed (completion flag set)
 # This ensures the UI updates immediately when a job completes via log stream,
 # without waiting for cache invalidation or API polling
-if faces_status_value == "running" and st.session_state.get(f"{ep_id}::faces_embed_just_completed"):
+if not faces_status_authoritative and faces_status_value == "running" and st.session_state.get(f"{ep_id}::faces_embed_just_completed"):
     faces_status_value = "success"  # Override to success since job completed
     LOGGER.info("[STATUS-FIX] Faces: Override stale 'running' -> 'success' due to just_completed flag")
     helpers.invalidate_running_jobs_cache(ep_id)
-if cluster_status_value == "running" and st.session_state.get(f"{ep_id}::cluster_just_completed"):
+if not cluster_status_authoritative and cluster_status_value == "running" and st.session_state.get(f"{ep_id}::cluster_just_completed"):
     cluster_status_value = "success"  # Override to success since job completed
     LOGGER.info("[STATUS-FIX] Cluster: Override stale 'running' -> 'success' due to just_completed flag")
     helpers.invalidate_running_jobs_cache(ep_id)
@@ -2935,33 +3125,38 @@ detect_status_value, tracks_ready, using_manifest_fallback, tracks_only_fallback
     tracks_ready_flag=tracks_ready_flag,
     job_state=detect_job_state,
 )
-if detect_status_value in {"missing", "unknown", "stale"}:
-    if (
-        manifest_state["manifest_ready"]
-        or manifest_state_local["manifest_ready"]
-        or (detections_path.exists() and tracks_path.exists())
-    ):
+if not detect_status_authoritative:
+    if detect_status_value in {"missing", "unknown", "stale"}:
+        if (
+            manifest_state["manifest_ready"]
+            or manifest_state_local["manifest_ready"]
+            or (detections_path.exists() and tracks_path.exists())
+        ):
+            detect_status_value = "success"
+            tracks_ready = True
+            using_manifest_fallback = True
+        elif manifest_state["detections_ready"] or manifest_state["tracks_ready"]:
+            detect_status_value = "partial"
+            tracks_ready = False
+            using_manifest_fallback = True
+    if detect_status_value in {"missing", "unknown", "stale"} and faces_status_value == "success":
         detect_status_value = "success"
         tracks_ready = True
         using_manifest_fallback = True
-    elif manifest_state["detections_ready"] or manifest_state["tracks_ready"]:
-        detect_status_value = "partial"
-        tracks_ready = False
-        using_manifest_fallback = True
-if detect_status_value in {"missing", "unknown", "stale"} and faces_status_value == "success":
-    detect_status_value = "success"
-    tracks_ready = True
-    using_manifest_fallback = True
 
-autorun_phase_hint = stage_layout.normalize_stage_key(st.session_state.get(_autorun_phase_key))
-autorun_detect_pending = bool(st.session_state.get("episode_detail_detect_autorun_flag"))
-if (
-    autorun_phase_hint == "detect"
-    and autorun_detect_pending
-    and detect_status_value in {"missing", "unknown", "stale"}
-):
-    detect_status_value = "running"
-if cluster_status_value in {"missing", "unknown"}:
+    autorun_phase_hint = stage_layout.normalize_stage_key(st.session_state.get(_autorun_phase_key))
+    autorun_detect_pending = bool(st.session_state.get("episode_detail_detect_autorun_flag"))
+    if (
+        autorun_phase_hint == "detect"
+        and autorun_detect_pending
+        and detect_status_value in {"missing", "unknown", "stale"}
+    ):
+        detect_status_value = "running"
+
+if detect_status_authoritative and canonical_detect_status:
+    detect_status_value = canonical_detect_status
+
+if not cluster_status_authoritative and cluster_status_value in {"missing", "unknown"}:
     identities_count_manifest = None
     cluster_metrics_block: dict[str, Any] | None = None
     artifact_mtime = 0.0
@@ -3295,6 +3490,18 @@ if selected_attempt_run_id:
                     detail_bits.append(f"torchreid_error={runtime_clean}")
                 fusion_mode_detail = "; ".join(detail_bits) if detail_bits else "Re-ID unavailable"
 
+if body_tracking_status_authoritative and canonical_body_tracking_status:
+    body_tracking_status_value = canonical_body_tracking_status
+    body_tracking_error = _canonical_stage_error(canonical_stage_entries.get("body_tracking")) or body_tracking_error
+
+if track_fusion_status_authoritative and canonical_track_fusion_status:
+    body_fusion_status_value = canonical_track_fusion_status
+    body_fusion_error = _canonical_stage_error(canonical_stage_entries.get("track_fusion")) or body_fusion_error
+
+if pdf_status_authoritative and canonical_pdf_status:
+    pdf_export_status_value = canonical_pdf_status
+    pdf_export_detail = _canonical_stage_error(canonical_stage_entries.get("pdf")) or pdf_export_detail
+
 body_tracking_progress_payload = None
 track_fusion_progress_payload = None
 if selected_attempt_run_id:
@@ -3349,7 +3556,7 @@ if faces_count_value is None and faces_manifest_count is not None:
 
 # If status API is missing but run-scoped artifacts exist locally, only synthesize a "success"
 # when we can also validate a matching run marker (prevents stale/other-run promotion).
-if not detect_phase_status and manifest_state_local["manifest_ready"]:
+if not detect_status_authoritative and not detect_phase_status and manifest_state_local["manifest_ready"]:
     marker_ok = False
     marker_payload: dict[str, Any] | None = None
     marker_path = _scoped_markers_dir / "detect_track.json"
@@ -3816,7 +4023,8 @@ with col1:
     if device_label:
         detect_params.append(f"device={device_label}")
     if (
-        detect_status_value in {"missing", "unknown", "stale"}
+        not detect_status_authoritative
+        and detect_status_value in {"missing", "unknown", "stale"}
         and detections_path.exists()
         and tracks_path.exists()
     ):
@@ -3868,6 +4076,14 @@ with col1:
         if stall_msg:
             st.warning(stall_msg)
         st.caption("Live progress appears in the log panel below.")
+    elif detect_status_value == "blocked":
+        st.warning("⛔ **Detect/Track**: Blocked")
+        _render_blocked_callout(
+            "detect",
+            canonical_stage_entries.get("detect"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif detect_status_value == "stale":
         st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
         st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
@@ -3966,7 +4182,15 @@ with col2:
         if stall_msg:
             st.warning(stall_msg)
         st.caption("Live progress appears in the log panel below.")
-    elif faces_job_state == "failed":
+    elif faces_status_value == "blocked":
+        st.warning("⛔ **Faces Harvest**: Blocked")
+        _render_blocked_callout(
+            "faces",
+            canonical_stage_entries.get("faces"),
+            ep_id,
+            selected_attempt_run_id,
+        )
+    elif faces_status_value in {"error", "failed"} or faces_job_state == "failed":
         st.error("⚠️ **Faces Harvest**: Failed")
         if faces_error_msg:
             st.caption(faces_error_msg)
@@ -4040,7 +4264,15 @@ with col3:
         if stall_msg:
             st.warning(stall_msg)
         st.caption("Live progress appears in the log panel below.")
-    elif cluster_job_state == "failed":
+    elif cluster_status_value == "blocked":
+        st.warning("⛔ **Cluster**: Blocked")
+        _render_blocked_callout(
+            "cluster",
+            canonical_stage_entries.get("cluster"),
+            ep_id,
+            selected_attempt_run_id,
+        )
+    elif cluster_status_value in {"error", "failed"} or cluster_job_state == "failed":
         st.error("⚠️ **Cluster**: Failed")
         if cluster_error_msg:
             st.caption(cluster_error_msg)
@@ -4169,6 +4401,14 @@ with row2_col1:
         if started:
             st.caption(f"Started at {started}")
         _render_downstream_progress(body_tracking_progress_display, running=True)
+    elif body_tracking_status_value == "blocked":
+        st.warning("⛔ **Body Tracking**: Blocked")
+        _render_blocked_callout(
+            "body_tracking",
+            canonical_stage_entries.get("body_tracking"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif body_tracking_status_value in {"error", "failed"}:
         st.error("⚠️ **Body Tracking**: Failed")
         if body_tracking_error:
@@ -4220,7 +4460,10 @@ with row2_col1:
 
     _render_downstream_log_expander(
         "Body Tracking",
-        marker_payload=body_tracking_marker_payload,
+        ep_id=ep_id,
+        stage_key="body_tracking",
+        run_id=selected_attempt_run_id,
+        status_value=body_tracking_status_value,
         progress_payload=body_tracking_progress_display,
         artifacts_hint="Body tracking artifacts found via manifest fallback."
         if body_tracking_manifest_fallback
@@ -4247,6 +4490,14 @@ with row2_col2:
         if started:
             st.caption(f"Started at {started}")
         _render_downstream_progress(track_fusion_progress_display, running=True)
+    elif body_fusion_status_value == "blocked":
+        st.warning("⛔ **Track Fusion**: Blocked")
+        _render_blocked_callout(
+            "track_fusion",
+            canonical_stage_entries.get("track_fusion"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif body_fusion_status_value in {"error", "failed"}:
         st.error("⚠️ **Track Fusion**: Failed")
         if body_fusion_error:
@@ -4340,7 +4591,10 @@ with row2_col2:
 
     _render_downstream_log_expander(
         "Track Fusion",
-        marker_payload=body_fusion_marker_payload,
+        ep_id=ep_id,
+        stage_key="track_fusion",
+        run_id=selected_attempt_run_id,
+        status_value=body_fusion_status_value,
         progress_payload=track_fusion_progress_display,
         artifacts_hint="Track fusion output found via manifest fallback."
         if body_fusion_manifest_fallback
@@ -4361,6 +4615,14 @@ with row2_col3:
         if started:
             st.caption(f"Started at {started}")
         _render_downstream_progress(pdf_progress_display, running=True)
+    elif pdf_export_status_value == "blocked":
+        st.warning("⛔ **PDF Export**: Blocked")
+        _render_blocked_callout(
+            "pdf",
+            canonical_stage_entries.get("pdf"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif pdf_export_status_value in {"error", "failed"}:
         st.error("⚠️ **PDF Export**: Failed")
         if pdf_export_detail:
@@ -4414,7 +4676,10 @@ with row2_col3:
 
     _render_downstream_log_expander(
         "PDF Export",
-        marker_payload=export_index if isinstance(export_index, dict) else None,
+        ep_id=ep_id,
+        stage_key="pdf",
+        run_id=selected_attempt_run_id,
+        status_value=pdf_export_status_value,
         progress_payload=pdf_progress_display,
     )
 
@@ -6006,7 +6271,10 @@ with col_detect:
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
     _render_downstream_log_expander(
         "Detect/Track",
-        marker_payload=detect_marker_payload,
+        ep_id=ep_id,
+        stage_key="detect",
+        run_id=selected_attempt_run_id,
+        status_value=detect_status_value,
         progress_payload=detect_progress_payload,
     )
 
@@ -6503,7 +6771,10 @@ with col_faces:
 
     _render_downstream_log_expander(
         "Faces Harvest",
-        marker_payload=faces_marker_payload,
+        ep_id=ep_id,
+        stage_key="faces",
+        run_id=selected_attempt_run_id,
+        status_value=faces_status_value,
         progress_payload=faces_progress_payload,
     )
 
@@ -7130,7 +7401,10 @@ with col_cluster:
 
     _render_downstream_log_expander(
         "Cluster",
-        marker_payload=cluster_marker_payload,
+        ep_id=ep_id,
+        stage_key="cluster",
+        run_id=selected_attempt_run_id,
+        status_value=cluster_status_value,
         progress_payload=cluster_progress_payload,
     )
 
@@ -7151,6 +7425,14 @@ with row3_col1:
     elif body_tracking_status_value == "running":
         st.info("⏳ **Body Tracking**: Running")
         _render_downstream_progress(body_tracking_progress_display, running=True)
+    elif body_tracking_status_value == "blocked":
+        st.warning("⛔ **Body Tracking**: Blocked")
+        _render_blocked_callout(
+            "body_tracking",
+            canonical_stage_entries.get("body_tracking"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif body_tracking_status_value in {"error", "failed"}:
         st.error("⚠️ **Body Tracking**: Failed")
         if body_tracking_error:
@@ -7200,7 +7482,10 @@ with row3_col1:
 
     _render_downstream_log_expander(
         "Body Tracking",
-        marker_payload=body_tracking_marker_payload,
+        ep_id=ep_id,
+        stage_key="body_tracking",
+        run_id=selected_attempt_run_id,
+        status_value=body_tracking_status_value,
         progress_payload=body_tracking_progress_display,
         artifacts_hint="Body tracking artifacts found via manifest fallback."
         if body_tracking_manifest_fallback
@@ -7222,6 +7507,14 @@ with row3_col2:
     elif body_fusion_status_value == "running":
         st.info("⏳ **Track Fusion**: Running")
         _render_downstream_progress(track_fusion_progress_display, running=True)
+    elif body_fusion_status_value == "blocked":
+        st.warning("⛔ **Track Fusion**: Blocked")
+        _render_blocked_callout(
+            "track_fusion",
+            canonical_stage_entries.get("track_fusion"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif body_fusion_status_value in {"error", "failed"}:
         st.error("⚠️ **Track Fusion**: Failed")
         if body_fusion_error:
@@ -7296,7 +7589,10 @@ with row3_col2:
 
     _render_downstream_log_expander(
         "Track Fusion",
-        marker_payload=body_fusion_marker_payload,
+        ep_id=ep_id,
+        stage_key="track_fusion",
+        run_id=selected_attempt_run_id,
+        status_value=body_fusion_status_value,
         progress_payload=track_fusion_progress_display,
         artifacts_hint="Track fusion output found via manifest fallback."
         if body_fusion_manifest_fallback
@@ -7316,6 +7612,14 @@ with row3_col3:
     elif pdf_export_status_value == "running":
         st.info("⏳ **PDF Export**: Running")
         _render_downstream_progress(pdf_progress_display, running=True)
+    elif pdf_export_status_value == "blocked":
+        st.warning("⛔ **PDF Export**: Blocked")
+        _render_blocked_callout(
+            "pdf",
+            canonical_stage_entries.get("pdf"),
+            ep_id,
+            selected_attempt_run_id,
+        )
     elif pdf_export_status_value in {"error", "failed"}:
         st.error("⚠️ **PDF Export**: Failed")
         if pdf_export_detail:
@@ -7359,7 +7663,10 @@ with row3_col3:
 
     _render_downstream_log_expander(
         "PDF Export",
-        marker_payload=export_index if isinstance(export_index, dict) else None,
+        ep_id=ep_id,
+        stage_key="pdf",
+        run_id=selected_attempt_run_id,
+        status_value=pdf_export_status_value,
         progress_payload=pdf_progress_display,
     )
 
@@ -7749,6 +8056,21 @@ with st.expander("Debug: Raw JSON artifacts", expanded=False):
 _any_job_running = running_detect_job or running_faces_job or running_cluster_job or running_audio_job
 _execution_mode = helpers.get_execution_mode(ep_id)
 
+auto_refresh_logs = False
+if status_running and not st_autorefresh:
+    auto_refresh_logs = st.toggle(
+        "Auto-refresh logs",
+        value=_execution_mode != "local",
+        key=f"{ep_id}::run_logs_autorefresh_toggle",
+    )
+    if _execution_mode == "local":
+        st.caption("Auto-refresh disabled in local mode; logs stream without refresh.")
+    else:
+        st.caption("Auto-refresh runs every ~2s while a stage is running.")
+
+if status_running and st_autorefresh and _execution_mode != "local":
+    st_autorefresh(interval=2000, key=f"{ep_id}::run_logs_autorefresh")
+
 # Check if a local mode job JUST completed
 # Two detection methods:
 # 1. progress.json shows "done" and was recently updated (for Detect/Track, Faces Harvest)
@@ -7776,21 +8098,26 @@ if _local_job_just_completed:
     import time as _time
     _time.sleep(1.5)
     st.rerun()
-elif _any_job_running and _execution_mode != "local":
-    # Celery mode: poll for updates since jobs run in background
-    import time as _time
-    _running_ops = []
-    if running_detect_job:
-        _running_ops.append("Detect/Track")
-    if running_faces_job:
-        _running_ops.append("Faces Harvest")
-    if running_cluster_job:
-        _running_ops.append("Cluster")
-    if running_audio_job:
-        _running_ops.append("Audio Pipeline")
-    st.caption(f"⏳ Auto-refreshing for running job(s): {', '.join(_running_ops)}...")
-    _time.sleep(3)
-    st.rerun()
+elif _any_job_running and _execution_mode != "local" and not st_autorefresh:
+    if status_running and not auto_refresh_logs:
+        st.caption("⏸️ Auto-refresh paused while stages are running.")
+        # Avoid sleeping/rerun when user disables refresh.
+        pass
+    else:
+        # Celery mode: poll for updates since jobs run in background
+        import time as _time
+        _running_ops = []
+        if running_detect_job:
+            _running_ops.append("Detect/Track")
+        if running_faces_job:
+            _running_ops.append("Faces Harvest")
+        if running_cluster_job:
+            _running_ops.append("Cluster")
+        if running_audio_job:
+            _running_ops.append("Audio Pipeline")
+        st.caption(f"⏳ Auto-refreshing for running job(s): {', '.join(_running_ops)}...")
+        _time.sleep(3)
+        st.rerun()
 elif _any_job_running and _execution_mode == "local":
     # Local mode: logs stream via SSE, no auto-refresh needed
     st.caption("📡 Streaming logs from local subprocess... (do not refresh page)")

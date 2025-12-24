@@ -1100,6 +1100,7 @@ class JobService:
         self,
         *,
         ep_id: str,
+        run_id: str | None = None,
         video_path: Path | str,
         device: str = "auto",
         stride: int = 1,
@@ -1118,6 +1119,7 @@ class JobService:
 
         Args:
             ep_id: Episode identifier (e.g., "rhobh-s05e14")
+            run_id: Optional run identifier (generated when omitted)
             video_path: Path to the source video file
             device: Execution device (auto, cpu, cuda, coreml)
             stride: Frame stride for detection
@@ -1136,6 +1138,9 @@ class JobService:
         if not video_path.exists():
             raise FileNotFoundError(f"Video not found: {video_path}")
 
+        os.environ["SCREENALYTICS_DATA_ROOT"] = str(self.data_root)
+        run_id_norm = run_layout.get_or_create_run_id(ep_id, run_id)
+
         ensure_dirs(ep_id)
 
         # Apply profile defaults if specified
@@ -1150,6 +1155,7 @@ class JobService:
         # Build the requested config for tracking
         requested: Dict[str, Any] = {
             "ep_id": ep_id,
+            "run_id": run_id_norm,
             "video_path": str(video_path),
             "device": device,
             "stride": stride,
@@ -1186,6 +1192,7 @@ class JobService:
 
         # Run the engine in a background thread
         def _run_engine() -> None:
+            result = None
             try:
                 # Import the engine
                 from py_screenalytics.pipeline import run_episode, EpisodeRunConfig
@@ -1202,6 +1209,7 @@ class JobService:
                     reuse_embeddings=reuse_embeddings,
                     data_root=self.data_root,
                     progress_file=progress_path,
+                    run_id=run_id_norm,
                 )
 
                 # Run the pipeline
@@ -1236,6 +1244,19 @@ class JobService:
                     self._mutate_job(job_id, _apply_error)
                 except JobNotFoundError:
                     pass
+            finally:
+                try:
+                    from apps.api.services.run_export import build_and_upload_debug_pdf, run_segments_export
+
+                    build_and_upload_debug_pdf(
+                        ep_id=ep_id,
+                        run_id=run_id_norm,
+                        upload_to_s3=False,
+                        write_index=True,
+                    )
+                    run_segments_export(ep_id=ep_id, run_id=run_id_norm)
+                except Exception as exc:
+                    LOGGER.warning("[export] Run export finalizer failed: %s", exc)
 
         thread = threading.Thread(
             target=_run_engine,

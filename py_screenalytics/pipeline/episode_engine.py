@@ -51,6 +51,19 @@ from py_screenalytics.pipeline.constants import (
     DEFAULT_NEW_TRACK_THRESH,
     DEFAULT_MIN_BOX_AREA,
 )
+from py_screenalytics import run_layout
+from py_screenalytics.episode_status import (
+    BlockedReason,
+    normalize_stage_key,
+    stage_artifacts,
+    write_stage_blocked,
+    write_stage_failed,
+    write_stage_finished,
+    write_stage_started,
+)
+from py_screenalytics.run_gates import GateReason, GateResult, check_prereqs
+from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
+from py_screenalytics.run_logs import append_log
 
 LOGGER = logging.getLogger("episode_engine")
 
@@ -193,6 +206,12 @@ class EpisodeRunConfig:
     """Optional file to write progress JSON"""
 
     # =========================================================================
+    # Run scoping
+    # =========================================================================
+    run_id: Optional[str] = None
+    """Run-scoped identifier (generated when omitted)"""
+
+    # =========================================================================
     # Stage selection
     # =========================================================================
     stages: PipelineStage = PipelineStage.ALL
@@ -249,6 +268,9 @@ class EpisodeRunConfig:
         # Convert data_root to Path if string
         if isinstance(self.data_root, str):
             self.data_root = Path(self.data_root).expanduser()
+
+        if self.run_id is not None:
+            self.run_id = run_layout.normalize_run_id(str(self.run_id))
 
 
 @dataclass
@@ -333,6 +355,9 @@ class EpisodeRunResult:
     runtime_sec: float
     """Total runtime in seconds"""
 
+    run_id: Optional[str] = None
+    """Run identifier for run-scoped artifacts"""
+
     # Aggregate counts from final stage
     frames_processed: int = 0
     tracks_count: int = 0
@@ -358,6 +383,7 @@ class EpisodeRunResult:
         """Convert to dictionary for JSON serialization."""
         return {
             "episode_id": self.episode_id,
+            "run_id": self.run_id,
             "success": self.success,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -380,6 +406,110 @@ class EpisodeRunResult:
 def _utcnow_iso() -> str:
     """Return current UTC time as ISO format string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _status_artifact_paths(ep_id: str, run_id: str, stage_key: str) -> Dict[str, str]:
+    normalized = normalize_stage_key(stage_key) or stage_key
+    try:
+        artifacts = stage_artifacts(ep_id, run_id, normalized)
+    except Exception:
+        return {}
+    paths: Dict[str, str] = {}
+    for entry in artifacts:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label")
+        path = entry.get("path")
+        if isinstance(label, str) and isinstance(path, str) and entry.get("exists"):
+            paths[label] = path
+    return paths
+
+
+def _stage_counts(stage: PipelineStage, summary: Dict[str, Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if stage == PipelineStage.DETECT_TRACK:
+        detections = summary.get("detections")
+        tracks = summary.get("tracks")
+        if isinstance(detections, int):
+            counts["detections"] = detections
+        if isinstance(tracks, int):
+            counts["tracks"] = tracks
+    elif stage == PipelineStage.FACES_EMBED:
+        faces = summary.get("faces")
+        if isinstance(faces, int):
+            counts["faces"] = faces
+    elif stage == PipelineStage.CLUSTER:
+        identities = summary.get("identities_count", summary.get("identities"))
+        faces = summary.get("faces_count", summary.get("faces"))
+        if isinstance(identities, int):
+            counts["identities"] = identities
+        if isinstance(faces, int):
+            counts["faces"] = faces
+    return counts
+
+
+def _stage_thresholds(stage: PipelineStage, config: EpisodeRunConfig) -> Dict[str, Any]:
+    if stage == PipelineStage.DETECT_TRACK:
+        return {
+            "det_thresh": config.det_thresh,
+            "stride": config.stride,
+            "track_high_thresh": config.track_high_thresh,
+            "new_track_thresh": config.new_track_thresh,
+        }
+    if stage == PipelineStage.FACES_EMBED:
+        return {
+            "max_samples_per_track": config.max_samples_per_track,
+            "min_samples_per_track": config.min_samples_per_track,
+            "sample_every_n_frames": config.sample_every_n_frames,
+        }
+    if stage == PipelineStage.CLUSTER:
+        return {
+            "cluster_thresh": config.cluster_thresh,
+            "min_cluster_size": config.min_cluster_size,
+            "min_identity_sim": config.min_identity_sim,
+        }
+    return {}
+
+
+def _stage_model_versions(stage: PipelineStage, summary: Dict[str, Any]) -> Dict[str, str]:
+    models: Dict[str, str] = {}
+    if stage == PipelineStage.DETECT_TRACK:
+        detector = summary.get("detector")
+        tracker = summary.get("tracker")
+        if isinstance(detector, str):
+            models["detector"] = detector
+        if isinstance(tracker, str):
+            models["tracker"] = tracker
+    elif stage == PipelineStage.FACES_EMBED:
+        embedding_model = summary.get("embedding_model")
+        if isinstance(embedding_model, str):
+            models["embedding_model"] = embedding_model
+    elif stage == PipelineStage.CLUSTER:
+        detector = summary.get("detector")
+        tracker = summary.get("tracker")
+        if isinstance(detector, str):
+            models["detector"] = detector
+        if isinstance(tracker, str):
+            models["tracker"] = tracker
+    return models
+
+
+def _blocked_details(gate: GateResult) -> tuple[BlockedReason, StageBlockedInfo]:
+    reasons = gate.reasons or [
+        GateReason(code="blocked", message="Stage blocked by prerequisites", details=None)
+    ]
+    primary = reasons[0]
+    details = {
+        "reasons": [reason.as_dict() for reason in reasons],
+        "suggested_actions": list(gate.suggested_actions),
+    }
+    blocked_reason = BlockedReason(
+        code=primary.code,
+        message=primary.message,
+        details=details,
+    )
+    blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
+    return blocked_reason, blocked_info
 
 
 # Disk space constants
@@ -581,12 +711,91 @@ def run_stage(
     started_at = _utcnow_iso()
     start_time = time.time()
 
+    try:
+        config.run_id = run_layout.get_or_create_run_id(episode_id, config.run_id)
+    except ValueError as exc:
+        return StageResult(
+            stage=stage.value,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            error=str(exc),
+        )
+
+    gate = check_prereqs(stage.value, episode_id, config.run_id)
+    if not gate.ok:
+        blocked_reason, blocked_info = _blocked_details(gate)
+        try:
+            append_log(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "WARNING",
+                "stage blocked",
+                progress=0.0,
+                meta={
+                    "reason_code": blocked_reason.code,
+                    "reason_message": blocked_reason.message,
+                    "suggested_actions": list(gate.suggested_actions),
+                },
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.warning("[run_logs] Failed to log %s blocked: %s", stage.value, log_exc)
+        try:
+            write_stage_blocked(episode_id, config.run_id, stage.value, blocked_reason)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark %s blocked: %s", stage.value, exc)
+        try:
+            write_stage_manifest(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "BLOCKED",
+                started_at=started_at,
+                finished_at=_utcnow_iso(),
+                duration_s=time.time() - start_time,
+                blocked=blocked_info,
+                thresholds=_stage_thresholds(stage, config),
+                counts=None,
+                artifacts=None,
+                model_versions=None,
+            )
+        except Exception as exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[manifest] Failed to write %s blocked manifest: %s", stage.value, exc)
+        return StageResult(
+            stage=stage.value,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            error=blocked_reason.message,
+        )
+
     # Set up data root environment variable
     if config.data_root:
         os.environ["SCREENALYTICS_DATA_ROOT"] = str(config.data_root)
 
     # Ensure directories exist
     ensure_artifact_dirs(episode_id, config.data_root)
+
+    if config.run_id:
+        try:
+            append_log(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "INFO",
+                "stage started",
+                progress=0.0,
+                meta={"video_path": str(video_path)},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.warning("[run_logs] Failed to log %s start: %s", stage.value, log_exc)
+        try:
+            write_stage_started(episode_id, config.run_id, stage.value)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark %s start: %s", stage.value, exc)
 
     try:
         # Import stage implementations from the stages module
@@ -611,6 +820,52 @@ def run_stage(
 
         # Check for stage-level failure
         if not summary.get("success", True):
+            if config.run_id:
+                try:
+                    append_log(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "ERROR",
+                        "stage failed",
+                        progress=100.0,
+                        meta={
+                            "error_code": "stage_failed",
+                            "error_message": str(summary.get("error", "Unknown error")),
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.warning("[run_logs] Failed to log %s failure: %s", stage.value, log_exc)
+                try:
+                    write_stage_failed(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        error_code="stage_failed",
+                        error_message=str(summary.get("error", "Unknown error")),
+                    )
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
+                try:
+                    write_stage_manifest(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "FAILED",
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_s=runtime_sec,
+                        error=StageErrorInfo(
+                            code="stage_failed",
+                            message=str(summary.get("error", "Unknown error")),
+                        ),
+                        thresholds=_stage_thresholds(stage, config),
+                        counts=_stage_counts(stage, summary),
+                        artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                        model_versions=_stage_model_versions(stage, summary),
+                    )
+                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                    LOGGER.warning("[manifest] Failed to write %s failed manifest: %s", stage.value, manifest_exc)
             return StageResult(
                 stage=stage.value,
                 success=False,
@@ -621,6 +876,47 @@ def run_stage(
             )
 
         # Extract results from summary
+        if config.run_id:
+            try:
+                counts = _stage_counts(stage, summary)
+                try:
+                    append_log(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "INFO",
+                        "stage finished",
+                        progress=100.0,
+                        meta={"counts": counts},
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.warning("[run_logs] Failed to log %s success: %s", stage.value, log_exc)
+                write_stage_finished(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    counts=counts,
+                    metrics=counts or None,
+                    artifact_paths=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark %s success: %s", stage.value, status_exc)
+            try:
+                write_stage_manifest(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "SUCCESS",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_s=runtime_sec,
+                    thresholds=_stage_thresholds(stage, config),
+                    counts=_stage_counts(stage, summary),
+                    artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                    model_versions=_stage_model_versions(stage, summary),
+                )
+            except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[manifest] Failed to write %s success manifest: %s", stage.value, manifest_exc)
         return StageResult(
             stage=stage.value,
             success=True,
@@ -643,6 +939,48 @@ def run_stage(
         runtime_sec = time.time() - start_time
         LOGGER.exception("Stage %s failed: %s", stage.value, exc)
 
+        if config.run_id:
+            try:
+                append_log(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={
+                        "error_code": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.warning("[run_logs] Failed to log %s failure: %s", stage.value, log_exc)
+            try:
+                write_stage_failed(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
+            try:
+                write_stage_manifest(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "FAILED",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_s=runtime_sec,
+                    error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+                    thresholds=_stage_thresholds(stage, config),
+                    artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                    model_versions=None,
+                )
+            except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[manifest] Failed to write %s failed manifest: %s", stage.value, manifest_exc)
         return StageResult(
             stage=stage.value,
             success=False,
@@ -735,10 +1073,27 @@ def run_episode(
     started_at = _utcnow_iso()
     start_time = time.time()
 
+    try:
+        config.run_id = run_layout.get_or_create_run_id(episode_id, config.run_id)
+    except ValueError as exc:
+        return EpisodeRunResult(
+            episode_id=episode_id,
+            run_id=config.run_id,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            config=config,
+            error=str(exc),
+        )
+
+    LOGGER.info("Pipeline run_id=%s for episode %s", config.run_id, episode_id)
+
     # Validate video path
     if not video_path.exists():
         return EpisodeRunResult(
             episode_id=episode_id,
+            run_id=config.run_id,
             success=False,
             started_at=started_at,
             finished_at=_utcnow_iso(),
@@ -765,6 +1120,7 @@ def run_episode(
     if not space_ok:
         return EpisodeRunResult(
             episode_id=episode_id,
+            run_id=config.run_id,
             success=False,
             started_at=started_at,
             finished_at=_utcnow_iso(),
@@ -956,6 +1312,7 @@ def run_episode(
 
     return EpisodeRunResult(
         episode_id=episode_id,
+        run_id=config.run_id,
         success=all_success,
         started_at=started_at,
         finished_at=finished_at,

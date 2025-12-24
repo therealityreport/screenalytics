@@ -86,6 +86,30 @@ def normalize_run_id(run_id: str) -> str:
     return value
 
 
+def get_or_create_run_id(
+    ep_id: str,
+    run_id: str | None,
+    *,
+    now: datetime | None = None,
+    create_dir: bool = True,
+) -> str:
+    """Normalize an explicit run_id or generate a new attempt run_id.
+
+    When run_id is missing, a human-readable AttemptN_... identifier is created
+    and (optionally) its run directory is created to reserve the ID.
+    """
+    if run_id is not None:
+        value = str(run_id).strip()
+        if not value:
+            raise ValueError("run_id must be non-empty")
+        return normalize_run_id(value)
+
+    new_run_id = generate_attempt_run_id(ep_id, now=now)
+    if create_dir:
+        run_root(ep_id, new_run_id).mkdir(parents=True, exist_ok=True)
+    return new_run_id
+
+
 def manifests_root(ep_id: str) -> Path:
     return get_path(ep_id, "detections").parent
 

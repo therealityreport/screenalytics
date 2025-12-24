@@ -1,0 +1,184 @@
+# Run-scoped status groundwork (repo map)
+
+## Status update (DONE in bbe3638)
+- Run ID propagation: DONE (end-to-end).
+- Repo map note: DONE (updated for run_id generation/propagation, jobs.py paths, PR checklist).
+- Regression tests for missing run_id: DONE (CLI + API coverage).
+- Dataclass init crash: DONE (EpisodeRunResult field ordering).
+
+## Branching + mainline
+- Mainline branch: `origin/main` (no `nov-18` branch present).
+- Feature branch: `screentime-improvements/run-scoped-observability`.
+- Base branch: `screentime-improvements/episode-details-downstream-stage`.
+- Base branch for triage: `main` (tracking `origin/main`).
+
+## run_id generation + format
+- `py_screenalytics/run_layout.py`: `generate_run_id()` uses UUID4 hex (32 chars).
+- `py_screenalytics/run_layout.py`: `generate_attempt_run_id()` returns `AttemptN_YYYY-MM-DD_HHMMSS_EST` with attempt number based on existing runs.
+- `py_screenalytics/run_layout.py`: `normalize_run_id()` enforces `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
+- `py_screenalytics/run_layout.py`: `get_or_create_run_id(...)` normalizes or generates run_id and reserves the run directory.
+
+## Run ID propagation (DONE)
+- CLI entrypoints generate run_id when omitted: `tools/episode_run.py`, `tools/run_pipeline.py`.
+- API entrypoint surfaces run_id: `apps/api/routers/jobs.py` → `/jobs/episode-run`.
+- Run_id generation lives in `apps/api/services/jobs.py` (`start_episode_run_job`).
+- Pipeline config/result carry run_id: `py_screenalytics/pipeline/episode_engine.py` (`EpisodeRunConfig`, `EpisodeRunResult`).
+- Stage runners receive run_id: `py_screenalytics/pipeline/stages.py` (`_config_to_args_namespace`).
+
+Acceptance:
+- No supported pipeline invocation path results in missing run_id inside stage execution.
+- Status updates never no-op due to missing run_id.
+
+## Run-scoped artifact layout
+- Local run-scoped artifacts live under `data/manifests/{ep_id}/runs/{run_id}/` (`py_screenalytics/run_layout.py`).
+- Legacy (non-run-scoped) manifests live under `data/manifests/{ep_id}/` (`py_screenalytics/run_layout.py`).
+- Run-scoped markers (phase JSON) live under `data/manifests/{ep_id}/runs/{run_id}/{phase}.json`.
+- Legacy markers live under `data/manifests/{ep_id}/runs/{phase}.json`.
+- S3 run layout lives under `runs/{show}/s{ss}/e{ee}/{run_id}/` (canonical) or `runs/{ep_id}/{run_id}/` (legacy), resolved in `py_screenalytics/run_layout.py`.
+
+## Current stage plan + naming keys
+- Stage plan used in UI/autorun/pipeline:
+  - `apps/workspace-ui/episode_detail_layout.py`: `PIPELINE_STAGE_PLAN = (detect, faces, cluster, body_tracking, track_fusion, pdf)`
+  - `apps/workspace-ui/pages/2_Episode_Detail.py`: `_SETUP_STAGE_PLAN = (detect, faces, cluster, body_tracking, track_fusion, pdf)`
+  - `py_screenalytics/autorun_plan.py`: `build_autorun_stage_plan()` returns `detect → faces → cluster → body_tracking → track_fusion → pdf`
+  - `py_screenalytics/episode_status.py`: `STAGE_PLAN` matches the same keys
+- Common aliases across UI/workers:
+  - Detect: `detect`, `detect_track`, `detect/track`.
+  - Faces: `faces`, `faces_embed`, `faces harvest`.
+  - Track fusion: `track_fusion`, `body_tracking_fusion`.
+  - PDF: `pdf`, `pdf_export`.
+  - Optional in export contexts: `screentime` / `screen_time` (see `apps/api/services/run_export.py`).
+
+## Prereq gating (centralized)
+- Gating module: `py_screenalytics/run_gates.py` (`check_prereqs`).
+- Enforcement points:
+  - Engine wrapper: `py_screenalytics/pipeline/episode_engine.py` (`run_stage`).
+  - CLI stages: `tools/episode_run.py`.
+  - Screentime CLI: `tools/analyze_screen_time.py`.
+  - Export PDF: `apps/api/services/run_export.py`.
+- Prereq map (stage → upstream + artifacts):
+  - `detect`: none.
+  - `faces`: upstream `detect`; artifact `tracks.jsonl`.
+  - `cluster`: upstream `faces`; artifacts `faces.jsonl`, `tracks.jsonl`.
+  - `body_tracking`: none (but `stage_disabled` when body tracking config disables).
+  - `track_fusion`: upstream `body_tracking`, `faces`; artifacts `body_tracking/body_tracks.jsonl`, `faces.jsonl`.
+  - `screentime`: upstream `cluster`; artifacts `tracks.jsonl`, `faces.jsonl`, `identities.json`.
+  - `pdf`: none.
+- Gate reasons: `missing_artifact`, `upstream_failed`, `upstream_not_success`, `run_id_mismatch`, `stage_disabled`.
+
+## Run-scoped stage manifests (schema + location)
+- Module: `py_screenalytics/run_manifests.py`.
+- Location: `data/manifests/{ep_id}/runs/{run_id}/manifests/{stage}.json`.
+- Schema (minimum fields):
+  - `schema_version`, `episode_id`, `run_id`, `stage`, `status`, `started_at`, `finished_at`, `duration_s`.
+  - `inputs`: upstream artifacts + media digests (video) when available.
+  - `model_versions`, `thresholds`, `counts` (empty dicts allowed).
+  - `artifacts`: list of `{logical_name, path, sha256}`.
+  - `error` for FAILED (code/message/exception_summary).
+  - `blocked` for BLOCKED (reasons + suggested_actions).
+- Digest caching: `data/manifests/{ep_id}/runs/{run_id}/digests.json` (size/mtime keyed sha256).
+
+## Run-scoped logs (JSONL)
+- Module: `py_screenalytics/run_logs.py`.
+- Location: `data/manifests/{ep_id}/runs/{run_id}/logs/{stage}.jsonl`.
+- Event fields: `ts`, `level`, `episode_id`, `run_id`, `stage`, `msg`, `progress` (optional), `meta` (optional).
+- Writer/reader: `append_log(...)`, `tail_logs(...)`, `read_stage_progress(...)`.
+- UI: Episode Detail tail-reads per-stage logs and progress for RUNNING/FAILED stages (see `apps/workspace-ui/pages/2_Episode_Detail.py`).
+
+## Run-scoped export artifacts (audit-ready)
+- PDF debug report:
+  - Generator: `apps/api/services/run_export.py:generate_run_debug_pdf(...)`.
+  - Location: `data/manifests/{ep_id}/runs/{run_id}/exports/run_debug.pdf`.
+  - Sourcing: canonical status (`episode_status.json`) + stage manifests + run logs only (no ad-hoc artifact reads).
+- Segments parquet:
+  - Exporter: `apps/api/services/run_export.py:export_segments_parquet(...)` / `run_segments_export(...)`.
+  - Location: `data/manifests/{ep_id}/runs/{run_id}/exports/segments.parquet`.
+  - Source artifact: `body_tracking/screentime_comparison.json` (run-scoped).
+  - Schema columns: `run_id`, `episode_id`, `model_versions` (JSON), `identity`, `identity_id`, `track_id`, `segment_start`, `segment_end`, `duration_s`, `confidence`, `source`, `thresholds_snapshot_hash`.
+  - Determinism: rows sorted by identity_id → track_id → segment_start → segment_end; JSON fields serialized with sorted keys.
+  - Reconciliation: per-identity segment duration sums must match `breakdown.body_only_duration` within ±0.1s per segment.
+  - Missing segments: export stage is BLOCKED and no parquet is written.
+
+## Current status sources (writers)
+- `tools/episode_run.py` writes phase markers via `_write_run_marker(...)` for detect/track, faces_embed, cluster, body_tracking, track_fusion.
+- `_write_run_marker(...)` writes **both** legacy and run-scoped markers and calls `_update_episode_status_from_marker(...)`.
+- `_update_episode_status_from_marker(...)` uses `py_screenalytics/episode_status.stage_update_from_marker()` + `update_episode_status()` to update `episode_status.json`.
+- `tools/episode_run.py` `StageStatusHeartbeat` writes progress + timestamps into `episode_status.json` during long-running stages.
+
+## Current status sources (readers)
+- Episode Detail UI reads API status (`/episodes/{ep_id}/status`) via `apps/workspace-ui/ui_helpers.py:get_episode_status()`.
+- Episode Detail UI reads the canonical run-scoped status via `apps/workspace-ui/pages/2_Episode_Detail.py:_cached_episode_status_file()` → `py_screenalytics/episode_status.read_episode_status(...)`.
+- Export/diagnostics read the file in `apps/api/services/run_export.py`.
+
+## Stage cards + stage plan rendering
+- Stage plan + labels + aliases are defined in `apps/workspace-ui/episode_detail_layout.py`.
+- Stage cards and downstream UI wiring live in `apps/workspace-ui/pages/2_Episode_Detail.py`.
+- Stage cards use canonical status + gating reasons; log panels read from `py_screenalytics/run_logs.py`.
+
+## Consistency notes
+- jobs.py disambiguation:
+  - API entrypoint: `apps/api/routers/jobs.py` (returns run_id in `/jobs/episode-run`).
+  - Service implementation: `apps/api/services/jobs.py` (generates run_id).
+- Naming: `run_id` is the only canonical identifier; the `AttemptN_...` format is a run_id, not a separate attempt_id concept.
+
+## Verification + cleanup tasks
+- DONE: CLI regression test for missing run_id (status file created with generated run_id).
+- DONE: API regression test for missing run_id (response includes run_id; run dir uses it).
+- DONE: Broader unit suite executed (minimum: `python -m pytest -q tests/unit`).
+- Re-verify canonical status hardening still holds after episode_status changes:
+  - Lost-update protection (lock or merge/retry).
+  - Monotonic transitions (no SUCCESS→RUNNING without force).
+  - Derived-status labeling (`is_derived`, `derived_from`).
+- Next milestone after verification: wire canonical status transitions for remaining stages.
+
+## Test failure triage and containment (MERGE BLOCKER)
+- Failing tests reported on this branch:
+  - `tests/unit/test_faces_embed_limits.py`
+  - `tests/unit/test_run_export_s3.py`
+  - `tests/unit/test_scene_fallback.py`
+  - `tests/unit/test_track_reps_run_scoped_crops.py`
+- REQUIRED: Determine if failures are baseline (present on `screentime-improvements/episode-details-downstream-stage`) or regressions.
+  - Run the same failing tests on the base branch and compare results.
+  - Record outcome in PR description: "fails on base branch too" vs "regression introduced here".
+- If regressions: fix on this branch (run-scoped paths and run_id handling must be used consistently).
+- If baseline: document as known failures and ensure this PR does not add new failures.
+- `test_run_export_s3` must be deterministic (skip when missing creds or mock S3).
+
+Node ids resolved:
+- `tests/unit/test_faces_embed_limits.py::test_episode_cap_keeps_tracks_and_downsamples`
+- `tests/unit/test_faces_embed_limits.py::test_frame_exporter_direct_s3`
+- `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_returns_upload_result`
+- `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_skips_upload_when_disabled`
+- `tests/unit/test_scene_fallback.py::test_scene_fallback_on_pyscenedetect_failure`
+- `tests/unit/test_scene_fallback.py::test_scene_fallback_when_opencv_cannot_open`
+- `tests/unit/test_scene_fallback.py::test_scene_requested_resolved_populated`
+- `tests/unit/test_track_reps_run_scoped_crops.py::test_compute_track_representative_finds_run_scoped_crops`
+
+## PR checklist (when opening PR)
+- Include commits: `01b9842` and `774a83d`.
+- Describe run_id propagation + compatibility notes.
+- List full paths for jobs.py changes.
+- Tests run (deduplicated; include broader unit suite).
+
+## Tests run
+- `python -m pytest -q tests/unit tests/api/test_jobs_episode_run_run_id.py` (fails: `test_faces_embed_limits`, `test_run_export_s3`, `test_scene_fallback`, `test_track_reps_run_scoped_crops`).
+- `python -m pytest -q tests/unit/test_run_id_cli_status.py tests/api/test_jobs_episode_run_run_id.py`.
+
+## Test triage results (baseline vs regression)
+- Base log: `tmp/test-triage/base_2025-12-23.txt`
+- Branch log: `tmp/test-triage/branch_2025-12-23.txt`
+
+| Test | Base result | Branch result | Classification | Notes / Root cause | Fix / Follow-up |
+| --- | --- | --- | --- | --- | --- |
+| `tests/unit/test_faces_embed_limits.py::test_episode_cap_keeps_tracks_and_downsamples` | FAIL | FAIL | baseline | `_load_track_samples` does not accept `max_faces_total` | Baseline fix needed (test vs API mismatch). |
+| `tests/unit/test_faces_embed_limits.py::test_frame_exporter_direct_s3` | FAIL | FAIL | baseline | `FrameExporter.__init__` missing `storage` arg | Baseline fix needed (test vs API mismatch). |
+| `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_returns_upload_result` | FAIL | FAIL | baseline | `metrics` is `None` during PDF build (`run_export.py`) | Baseline fix needed; not run_id-related. |
+| `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_skips_upload_when_disabled` | FAIL | FAIL | baseline | Same `metrics` None crash | Baseline fix needed; not run_id-related. |
+| `tests/unit/test_scene_fallback.py::test_scene_fallback_on_pyscenedetect_failure` | FAIL | FAIL | baseline | `detect_scene_cuts_pyscenedetect` exception not handled | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_scene_fallback.py::test_scene_fallback_when_opencv_cannot_open` | FAIL | FAIL | baseline | `_opencv_can_open` missing in `episode_run.py` | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_scene_fallback.py::test_scene_requested_resolved_populated` | FAIL | FAIL | baseline | `_opencv_has_ffmpeg` missing in `episode_run.py` | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_track_reps_run_scoped_crops.py::test_compute_track_representative_finds_run_scoped_crops` | FAIL | FAIL | baseline | Run-scoped crop resolution returns `None` | Baseline fix needed in `track_reps` logic. |
+
+Known failing on base branch:
+- All eight node ids above fail on `main` and on this branch.
+- Failures are deterministic in local runs (not tied to AWS/S3 credentials); `test_run_export_s3` currently fails before any upload due to `metrics` being `None`.

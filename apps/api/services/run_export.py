@@ -8,6 +8,7 @@ Also provides PDF report generation for Screen Time Run Debug Reports.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -29,11 +30,28 @@ import yaml
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
 from py_screenalytics.episode_status import (
+    BlockedReason,
+    Stage,
+    STAGE_PLAN,
     collect_git_state,
     normalize_stage_key,
+    read_episode_status,
     stage_artifacts,
     update_episode_status,
+    write_stage_blocked,
+    write_stage_failed,
+    write_stage_finished,
+    write_stage_started,
 )
+from py_screenalytics.run_gates import GateReason, check_prereqs
+from py_screenalytics.run_manifests import (
+    StageBlockedInfo,
+    StageErrorInfo,
+    load_stage_manifests,
+    read_stage_manifest,
+    write_stage_manifest,
+)
+from py_screenalytics.run_logs import append_log, tail_logs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +71,71 @@ def _read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _json_dumps_sorted(payload: Any) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _hash_snapshot(payload: Any) -> str | None:
+    if payload is None:
+        return None
+    digest = hashlib.sha256(_json_dumps_sorted(payload).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_iso(value: str | None) -> str:
+    if not value:
+        return "—"
+    return value
+
+
+def _read_status_payload(ep_id: str, run_id: str) -> dict[str, Any]:
+    path = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id)) / "episode_status.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _stage_order_from_status(status: Any) -> list[str]:
+    raw_plan = list(getattr(status, "stage_plan", []) or [])
+    ordered: list[str] = []
+    for entry in raw_plan:
+        if isinstance(entry, str):
+            key = entry
+        elif hasattr(entry, "value"):
+            key = str(entry.value)
+        else:
+            key = str(entry)
+        if key and key not in ordered:
+            ordered.append(key)
+    if not ordered:
+        ordered = list(STAGE_PLAN)
+    for stage in getattr(status, "stages", {}).keys():
+        key = stage.value if hasattr(stage, "value") else str(stage)
+        if key not in ordered:
+            ordered.append(key)
+    return ordered
 
 
 def _sanitize_pdf_text(text: str) -> str:
@@ -460,7 +543,7 @@ def build_run_debug_bundle_zip(
 
             # Always include the PDF debug report for quick inspection.
             try:
-                pdf_bytes, _pdf_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id_norm)
+                pdf_bytes = generate_run_debug_pdf(ep_id, run_id_norm).read_bytes()
             except Exception as exc:
                 LOGGER.warning("[export] Failed to build debug report PDF: %s", exc)
             else:
@@ -1301,6 +1384,252 @@ def _face_tracks_duration_fallback(tracks_path: Path) -> dict[str, Any]:
         "tracks_count": tracks_count,
         "total_duration_s": total_duration_s,
     }
+
+
+def _build_run_debug_pdf_bytes(*, ep_id: str, run_id: str) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("reportlab is required to build PDF debug reports (pip install reportlab)") from exc
+
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    run_root = run_layout.run_root(ep_id, run_id_norm)
+    if not run_root.exists():
+        raise FileNotFoundError(f"Run not found on disk: {run_root}")
+
+    status_payload = _read_status_payload(ep_id, run_id_norm)
+    status = read_episode_status(ep_id, run_id_norm)
+    stage_keys = _stage_order_from_status(status)
+    manifests = load_stage_manifests(ep_id, run_id_norm, stage_keys)
+
+    styles = getSampleStyleSheet()
+    base_style = ParagraphStyle(
+        "RunDebugBody",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=11,
+        wordWrap="CJK",
+    )
+    header_style = ParagraphStyle(
+        "RunDebugHeader",
+        parent=base_style,
+        fontName="Helvetica-Bold",
+        textColor=colors.white,
+    )
+    title_style = ParagraphStyle(
+        "RunDebugTitle",
+        parent=styles["Heading1"],
+        fontSize=16,
+        leading=20,
+        textColor=colors.HexColor("#1a202c"),
+    )
+    section_style = ParagraphStyle(
+        "RunDebugSection",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=14,
+        textColor=colors.HexColor("#1a202c"),
+    )
+
+    def _fmt_dt(value: datetime | None) -> str:
+        if not value:
+            return "N/A"
+        if value.tzinfo is None:
+            return value.replace(microsecond=0).isoformat()
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _fmt_val(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, (float, int)):
+            return f"{value:.3f}" if isinstance(value, float) else str(value)
+        return str(value)
+
+    def _add_section(title: str, rows: list[tuple[str, Any]]) -> None:
+        story.append(Paragraph(title, section_style))
+        if rows:
+            story.append(
+                build_wrap_safe_kv_table(
+                    rows,
+                    width=doc.width,
+                    header=("Field", "Value"),
+                    cell_style=base_style,
+                    header_style=header_style,
+                )
+            )
+        else:
+            story.append(Paragraph("No data available.", base_style))
+        story.append(Spacer(1, 0.15 * inch))
+
+    story: list[Any] = []
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+
+    story.append(Paragraph("Run Debug Report", title_style))
+    story.append(Spacer(1, 0.12 * inch))
+
+    started_times = [state.started_at for state in status.stages.values() if state.started_at]
+    finished_times = [state.finished_at for state in status.stages.values() if state.finished_at]
+    run_started = min(started_times) if started_times else None
+    run_finished = max(finished_times) if finished_times else None
+
+    header_rows = [
+        ("episode_id", ep_id),
+        ("run_id", run_id_norm),
+        ("generated_at", _fmt_val(status_payload.get("generated_at"))),
+        ("run_started_at", _fmt_dt(run_started)),
+        ("run_finished_at", _fmt_dt(run_finished)),
+    ]
+    _add_section("Run Header", header_rows)
+
+    env_rows: list[tuple[str, Any]] = []
+    for key in ("git_sha", "git_branch", "git_dirty"):
+        if key in status_payload:
+            env_rows.append((key, _fmt_val(status_payload.get(key))))
+    env_payload = status_payload.get("env")
+    if isinstance(env_payload, dict):
+        for key in sorted(env_payload.keys()):
+            env_rows.append((key, _fmt_val(env_payload.get(key))))
+    storage_payload = status_payload.get("storage")
+    if isinstance(storage_payload, dict):
+        for key in sorted(storage_payload.keys()):
+            env_rows.append((f"storage.{key}", _fmt_val(storage_payload.get(key))))
+    _add_section("Environment Summary", env_rows)
+
+    timeline_rows: list[tuple[str, Any]] = []
+    for stage_key in stage_keys:
+        stage_enum = Stage.from_key(stage_key)
+        state = status.stages.get(stage_enum) if stage_enum else None
+        status_value = state.status.value if state else "not_started"
+        details: list[tuple[str, str]] = [
+            ("status", status_value),
+            ("started_at", _fmt_dt(state.started_at) if state else "N/A"),
+            ("finished_at", _fmt_dt(state.finished_at) if state else "N/A"),
+            ("duration_s", _fmt_val(state.duration_s) if state else "N/A"),
+            ("derived", "yes" if state and state.derived else "no"),
+        ]
+        if state and state.blocked_reason:
+            details.append(("reason_code", state.blocked_reason.code))
+            details.append(("reason_message", state.blocked_reason.message))
+        if state and state.derived and state.derived_from:
+            details.append(("derived_from", ", ".join(state.derived_from)))
+        timeline_rows.append((stage_key, details))
+    _add_section("Stage Timeline", timeline_rows)
+
+    provenance_rows: list[tuple[str, Any]] = []
+    for stage_key in stage_keys:
+        manifest = manifests.get(stage_key)
+        if not isinstance(manifest, dict):
+            continue
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list):
+            continue
+        artifact_rows: list[tuple[str, str]] = []
+        for entry in artifacts:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("logical_name") or entry.get("label")
+            path = entry.get("path")
+            sha = entry.get("sha256")
+            if isinstance(label, str) and isinstance(path, str):
+                digest = f" sha256={sha}" if isinstance(sha, str) else ""
+                artifact_rows.append((label, f"{path}{digest}"))
+        if artifact_rows:
+            artifact_rows.sort(key=lambda item: item[0])
+            provenance_rows.append((stage_key, artifact_rows))
+    _add_section("Provenance (Artifacts + Digests)", provenance_rows)
+
+    config_rows: list[tuple[str, Any]] = []
+    for stage_key in stage_keys:
+        manifest = manifests.get(stage_key)
+        if not isinstance(manifest, dict):
+            continue
+        model_versions = manifest.get("model_versions")
+        thresholds = manifest.get("thresholds")
+        if not isinstance(model_versions, dict) and not isinstance(thresholds, dict):
+            continue
+        details: list[tuple[str, str]] = []
+        if isinstance(model_versions, dict):
+            for key in sorted(model_versions.keys()):
+                details.append((f"model.{key}", _fmt_val(model_versions.get(key))))
+        if isinstance(thresholds, dict):
+            for key in sorted(thresholds.keys()):
+                details.append((f"threshold.{key}", _fmt_val(thresholds.get(key))))
+        if details:
+            config_rows.append((stage_key, details))
+    _add_section("Config Snapshot", config_rows)
+
+    counts_rows: list[tuple[str, Any]] = []
+    for stage_key in stage_keys:
+        manifest = manifests.get(stage_key)
+        if not isinstance(manifest, dict):
+            continue
+        counts = manifest.get("counts")
+        if not isinstance(counts, dict):
+            continue
+        details: list[tuple[str, str]] = []
+        for key in sorted(counts.keys()):
+            details.append((key, _fmt_val(counts.get(key))))
+        if details:
+            counts_rows.append((stage_key, details))
+    _add_section("Quality Counters", counts_rows)
+
+    error_rows: list[tuple[str, Any]] = []
+    for stage_key in stage_keys:
+        stage_enum = Stage.from_key(stage_key)
+        state = status.stages.get(stage_enum) if stage_enum else None
+        if not state or state.status.value not in {"failed", "blocked"}:
+            continue
+        details: list[tuple[str, str]] = []
+        if state.blocked_reason:
+            details.append(("code", state.blocked_reason.code))
+            details.append(("message", state.blocked_reason.message))
+        manifest = manifests.get(stage_key)
+        if isinstance(manifest, dict):
+            error = manifest.get("error")
+            if isinstance(error, dict):
+                code = error.get("error_code")
+                message = error.get("error_message")
+                if code and ("code", str(code)) not in details:
+                    details.append(("manifest_code", _fmt_val(code)))
+                if message and ("message", str(message)) not in details:
+                    details.append(("manifest_message", _fmt_val(message)))
+        logs = tail_logs(ep_id, run_id_norm, stage_key, n=50)
+        log_lines: list[str] = []
+        for entry in logs:
+            if not isinstance(entry, dict):
+                continue
+            level = str(entry.get("level", "")).upper()
+            if level not in {"WARNING", "ERROR"}:
+                continue
+            ts = entry.get("ts", "")
+            msg = entry.get("msg", "")
+            log_lines.append(f"{ts} [{level}] {msg}".strip())
+        for idx, line in enumerate(log_lines[-5:], start=1):
+            details.append((f"log_{idx}", line))
+        if details:
+            error_rows.append((stage_key, details))
+    _add_section("Error + Warning Digest", error_rows)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def generate_run_debug_pdf(
+    episode_id: str,
+    run_id: str,
+    *,
+    output_path: str | Path | None = None,
+) -> Path:
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    path = Path(output_path) if output_path else run_layout.run_root(episode_id, run_id_norm) / "exports" / "run_debug.pdf"
+    pdf_bytes = _build_run_debug_pdf_bytes(ep_id=episode_id, run_id=run_id_norm)
+    _atomic_write_bytes(path, pdf_bytes)
+    return path
 
 
 def build_screentime_run_debug_pdf(
@@ -5521,12 +5850,73 @@ def build_and_upload_debug_pdf(
         (pdf_bytes, download_filename, upload_result or None)
     """
     started_at = _now_iso()
+    run_id_norm = run_layout.normalize_run_id(run_id)
     heartbeat_interval = 5.0
     last_tick = 0.0
     frames_done_at: str | None = None
     finalize_started_at: str | None = None
     ended_at: str | None = None
     total_steps = 1
+    gate = check_prereqs("pdf", ep_id, run_id)
+    if not gate.ok:
+        reasons = gate.reasons or []
+        primary = reasons[0] if reasons else None
+        blocked_reason = BlockedReason(
+            code=primary.code if primary else "blocked",
+            message=primary.message if primary else "Stage blocked by prerequisites",
+            details={
+                "reasons": [reason.as_dict() for reason in reasons],
+                "suggested_actions": list(gate.suggested_actions),
+            },
+        )
+        blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
+        try:
+            write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[export] Failed to mark PDF blocked: %s", exc)
+        try:
+            append_log(
+                ep_id,
+                run_id,
+                "pdf",
+                "WARNING",
+                "stage blocked",
+                progress=0.0,
+                meta={
+                    "reason_code": blocked_reason.code,
+                    "reason_message": blocked_reason.message,
+                    "suggested_actions": list(gate.suggested_actions),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log PDF blocked: %s", exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id,
+                "pdf",
+                "BLOCKED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                blocked=blocked_info,
+            )
+        except Exception as exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[export] Failed to write PDF blocked manifest: %s", exc)
+        raise RuntimeError(blocked_reason.message)
+    try:
+        try:
+            append_log(ep_id, run_id, "pdf", "INFO", "stage started", progress=0.0)
+        except Exception as exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log PDF start: %s", exc)
+        write_stage_started(
+            ep_id,
+            run_id,
+            "pdf",
+            started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+        )
+    except Exception as exc:  # pragma: no cover - best effort status update
+        LOGGER.warning("[export] Failed to mark PDF start: %s", exc)
 
     def _emit_pdf_progress(
         *,
@@ -5564,7 +5954,6 @@ def build_and_upload_debug_pdf(
             "ended_at": ended_at,
         }
         stage_update = {
-            "status": "running",
             "progress": progress_payload,
             "timestamps": timestamps_payload,
         }
@@ -5601,10 +5990,9 @@ def build_and_upload_debug_pdf(
     _emit_pdf_progress(done=0, phase="running", message="Building debug PDF", force=True)
     try:
         pdf_bytes, download_name = _run_with_heartbeat(
-            lambda: build_screentime_run_debug_pdf(
-                ep_id=ep_id,
-                run_id=run_id,
-                include_screentime=include_screentime,
+            lambda: (
+                generate_run_debug_pdf(ep_id, run_id_norm).read_bytes(),
+                f"screenalytics_{ep_id}_{run_id_norm}_debug_report.pdf",
             ),
             phase="running",
             message="Building debug PDF",
@@ -5619,23 +6007,50 @@ def build_and_upload_debug_pdf(
             mark_end=True,
         )
         try:
-            update_episode_status(
+            write_stage_failed(
                 ep_id,
                 run_id,
-                stage_key="pdf",
-                stage_update={
-                    "status": "error",
-                    "started_at": started_at,
-                    "ended_at": _now_iso(),
-                    "duration_s": None,
-                    "error_reason": str(exc),
-                    "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
-                    "metrics": {},
+                "pdf",
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+                artifact_paths={
+                    entry["label"]: entry["path"]
+                    for entry in stage_artifacts(ep_id, run_id, "pdf")
+                    if isinstance(entry, dict) and entry.get("exists")
                 },
-                git_info=collect_git_state(),
             )
         except Exception as status_exc:
             LOGGER.warning("[export] Failed to update episode_status.json for PDF error: %s", status_exc)
+        try:
+            append_log(
+                ep_id,
+                run_id,
+                "pdf",
+                "ERROR",
+                "stage failed",
+                progress=100.0,
+                meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+            )
+        except Exception as log_exc:
+            LOGGER.debug("[run_logs] Failed to log PDF failure: %s", log_exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id,
+                "pdf",
+                "FAILED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+                artifacts={
+                    entry["label"]: entry["path"]
+                    for entry in stage_artifacts(ep_id, run_id, "pdf")
+                    if isinstance(entry, dict) and entry.get("exists")
+                },
+            )
+        except Exception as manifest_exc:
+            LOGGER.warning("[export] Failed to write PDF failed manifest: %s", manifest_exc)
         raise
 
     upload_result = None
@@ -5703,29 +6118,406 @@ def build_and_upload_debug_pdf(
     )
 
     try:
-        update_episode_status(
+        write_stage_finished(
             ep_id,
             run_id,
-            stage_key="pdf",
-            stage_update={
-                "status": "success",
-                "started_at": started_at,
-                "ended_at": _now_iso(),
-                "duration_s": None,
-                "error_reason": None,
-                "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
-                "metrics": {
-                    "export_bytes": len(pdf_bytes),
-                    "export_key": upload_result.s3_key if upload_result else None,
-                    "upload_success": upload_result.success if upload_result else None,
-                },
+            "pdf",
+            artifact_paths={
+                entry["label"]: entry["path"]
+                for entry in stage_artifacts(ep_id, run_id, "pdf")
+                if isinstance(entry, dict) and entry.get("exists")
             },
-            git_info=collect_git_state(),
+            metrics={
+                "export_bytes": len(pdf_bytes),
+                "export_key": upload_result.s3_key if upload_result else None,
+                "upload_success": upload_result.success if upload_result else None,
+            },
         )
     except Exception as exc:
         LOGGER.warning("[export] Failed to update episode_status.json for PDF success: %s", exc)
+    try:
+        append_log(
+            ep_id,
+            run_id,
+            "pdf",
+            "INFO",
+            "stage finished",
+            progress=100.0,
+            meta={"export_bytes": len(pdf_bytes)},
+        )
+    except Exception as log_exc:
+        LOGGER.debug("[run_logs] Failed to log PDF success: %s", log_exc)
+    try:
+        write_stage_manifest(
+            ep_id,
+            run_id,
+            "pdf",
+            "SUCCESS",
+            started_at=started_at,
+            finished_at=_now_iso(),
+            duration_s=None,
+            counts={"export_bytes": len(pdf_bytes)},
+            artifacts={
+                entry["label"]: entry["path"]
+                for entry in stage_artifacts(ep_id, run_id, "pdf")
+                if isinstance(entry, dict) and entry.get("exists")
+            },
+        )
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to write PDF success manifest: %s", exc)
 
     return pdf_bytes, download_name, upload_result
+
+
+def _segments_source_path(ep_id: str, run_id: str) -> Path:
+    run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+    return run_root / "body_tracking" / "screentime_comparison.json"
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_segments_dataframe(ep_id: str, run_id: str) -> tuple[Any, dict[str, Any]]:
+    try:
+        import pandas as pd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("pandas is required for segments.parquet export (pip install pandas pyarrow)") from exc
+
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    source_path = _segments_source_path(ep_id, run_id_norm)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing screentime comparison: {source_path}")
+    payload = _read_json(source_path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unreadable screentime comparison payload: {source_path}")
+
+    breakdowns = payload.get("breakdowns") or []
+    if not isinstance(breakdowns, list):
+        raise ValueError(f"Invalid screentime comparison breakdowns: {source_path}")
+
+    manifest = (
+        read_stage_manifest(ep_id, run_id_norm, "screentime")
+        or read_stage_manifest(ep_id, run_id_norm, "track_fusion")
+        or {}
+    )
+    model_versions = manifest.get("model_versions") if isinstance(manifest.get("model_versions"), dict) else {}
+    thresholds = manifest.get("thresholds") if isinstance(manifest.get("thresholds"), dict) else {}
+    model_versions_json = _json_dumps_sorted(model_versions) if model_versions else None
+    thresholds_hash = _hash_snapshot(thresholds)
+
+    rows: list[dict[str, Any]] = []
+    identity_ids: set[str] = set()
+    for breakdown in breakdowns:
+        if not isinstance(breakdown, dict):
+            continue
+        identity_id = breakdown.get("identity_id")
+        identity_label = breakdown.get("identity")
+        if identity_id is not None:
+            identity_ids.add(str(identity_id))
+        segments = breakdown.get("body_only_segments") or []
+        if not isinstance(segments, list):
+            raise ValueError(f"Invalid body_only_segments for identity {identity_id}")
+
+        observed_duration = 0.0
+        valid_segments = 0
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            start_time = _coerce_float(seg.get("start_time"))
+            end_time = _coerce_float(seg.get("end_time"))
+            duration = _coerce_float(seg.get("duration"))
+            if duration is None and start_time is not None and end_time is not None:
+                duration = end_time - start_time
+            if start_time is None or end_time is None or duration is None:
+                raise ValueError(f"Invalid segment timing for identity {identity_id}")
+            source = seg.get("segment_type") or "body_only"
+            rows.append(
+                {
+                    "run_id": run_id_norm,
+                    "episode_id": ep_id,
+                    "model_versions": model_versions_json,
+                    "identity": identity_label,
+                    "identity_id": str(identity_id) if identity_id is not None else None,
+                    "track_id": None,
+                    "segment_start": float(start_time),
+                    "segment_end": float(end_time),
+                    "duration_s": float(duration),
+                    "confidence": None,
+                    "source": str(source),
+                    "thresholds_snapshot_hash": thresholds_hash,
+                }
+            )
+            observed_duration += float(duration)
+            valid_segments += 1
+
+        expected = None
+        breakdown_block = breakdown.get("breakdown")
+        if isinstance(breakdown_block, dict):
+            expected = _coerce_float(breakdown_block.get("body_only_duration"))
+        if expected is not None:
+            tolerance = 0.1 * max(valid_segments, 1)
+            if abs(observed_duration - expected) > tolerance:
+                raise ValueError(
+                    f"Segment duration mismatch for {identity_id}: observed={observed_duration:.3f}s "
+                    f"expected={expected:.3f}s tolerance={tolerance:.3f}s"
+                )
+
+    columns = [
+        "run_id",
+        "episode_id",
+        "model_versions",
+        "identity",
+        "identity_id",
+        "track_id",
+        "segment_start",
+        "segment_end",
+        "duration_s",
+        "confidence",
+        "source",
+        "thresholds_snapshot_hash",
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    if not df.empty:
+        df = df.sort_values(
+            ["identity_id", "track_id", "segment_start", "segment_end"],
+            na_position="last",
+            kind="mergesort",
+        )
+
+    meta = {
+        "segment_count": len(rows),
+        "identity_count": len(identity_ids),
+        "model_versions": model_versions,
+        "thresholds": thresholds,
+        "thresholds_snapshot_hash": thresholds_hash,
+        "source_path": str(source_path),
+    }
+    return df, meta
+
+
+def export_segments_parquet(
+    episode_id: str,
+    run_id: str,
+    *,
+    output_path: str | Path | None = None,
+) -> Path:
+    df, _meta = _build_segments_dataframe(episode_id, run_id)
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    path = (
+        Path(output_path)
+        if output_path
+        else run_layout.run_root(episode_id, run_id_norm) / "exports" / "segments.parquet"
+    )
+    return _write_segments_parquet(df, path)
+
+
+def _write_segments_parquet(df: Any, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(path)
+    return path
+
+
+def run_segments_export(
+    *,
+    ep_id: str,
+    run_id: str,
+) -> Path | None:
+    started_at = _now_iso()
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    try:
+        append_log(ep_id, run_id_norm, "segments", "INFO", "stage started", progress=0.0)
+    except Exception as exc:  # pragma: no cover - best effort log write
+        LOGGER.debug("[run_logs] Failed to log segments start: %s", exc)
+
+    try:
+        write_stage_started(ep_id, run_id_norm, "segments")
+    except Exception as exc:  # pragma: no cover - best effort status update
+        LOGGER.warning("[export] Failed to mark segments start: %s", exc)
+
+    try:
+        df, meta = _build_segments_dataframe(ep_id, run_id_norm)
+    except FileNotFoundError as exc:
+        blocked_reason = BlockedReason(
+            code="missing_artifact",
+            message="segments source missing",
+            details={"expected_path": str(_segments_source_path(ep_id, run_id_norm))},
+        )
+        blocked_info = StageBlockedInfo(
+            reasons=[
+                GateReason(
+                    code=blocked_reason.code,
+                    message=blocked_reason.message,
+                    details=blocked_reason.details,
+                )
+            ],
+            suggested_actions=["Run track_fusion to generate screentime_comparison.json."],
+        )
+        try:
+            write_stage_blocked(ep_id, run_id_norm, "segments", blocked_reason)
+        except Exception as status_exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[export] Failed to mark segments blocked: %s", status_exc)
+        try:
+            append_log(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "WARNING",
+                "stage blocked",
+                progress=0.0,
+                meta={"reason_code": blocked_reason.code, "reason_message": blocked_reason.message},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log segments blocked: %s", log_exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "BLOCKED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                blocked=blocked_info,
+            )
+        except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[export] Failed to write segments blocked manifest: %s", manifest_exc)
+        LOGGER.info("[export] segments.parquet blocked: %s", exc)
+        return None
+    except Exception as exc:
+        try:
+            write_stage_failed(
+                ep_id,
+                run_id_norm,
+                "segments",
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+            )
+        except Exception as status_exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[export] Failed to mark segments failed: %s", status_exc)
+        try:
+            append_log(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "ERROR",
+                "stage failed",
+                progress=100.0,
+                meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log segments failed: %s", log_exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "FAILED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+            )
+        except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[export] Failed to write segments failed manifest: %s", manifest_exc)
+        raise
+
+    try:
+        output_path = _write_segments_parquet(
+            df,
+            run_layout.run_root(ep_id, run_id_norm) / "exports" / "segments.parquet",
+        )
+    except Exception as exc:
+        try:
+            write_stage_failed(
+                ep_id,
+                run_id_norm,
+                "segments",
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+            )
+        except Exception as status_exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[export] Failed to mark segments failed: %s", status_exc)
+        try:
+            append_log(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "ERROR",
+                "stage failed",
+                progress=100.0,
+                meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log segments failed: %s", log_exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id_norm,
+                "segments",
+                "FAILED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+            )
+        except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[export] Failed to write segments failed manifest: %s", manifest_exc)
+        raise
+
+    counts = {
+        "segments": int(meta.get("segment_count", 0) or 0),
+        "identities": int(meta.get("identity_count", 0) or 0),
+    }
+    try:
+        write_stage_finished(
+            ep_id,
+            run_id_norm,
+            "segments",
+            artifact_paths={"segments.parquet": str(output_path)},
+            counts=counts,
+        )
+    except Exception as status_exc:  # pragma: no cover - best effort status update
+        LOGGER.warning("[export] Failed to mark segments success: %s", status_exc)
+    try:
+        append_log(
+            ep_id,
+            run_id_norm,
+            "segments",
+            "INFO",
+            "stage finished",
+            progress=100.0,
+            meta={"segments": counts["segments"], "identities": counts["identities"]},
+        )
+    except Exception as log_exc:  # pragma: no cover - best effort log write
+        LOGGER.debug("[run_logs] Failed to log segments success: %s", log_exc)
+    try:
+        write_stage_manifest(
+            ep_id,
+            run_id_norm,
+            "segments",
+            "SUCCESS",
+            started_at=started_at,
+            finished_at=_now_iso(),
+            duration_s=None,
+            counts=counts,
+            artifacts={"exports/segments.parquet": str(output_path)},
+            model_versions=meta.get("model_versions"),
+            thresholds=meta.get("thresholds"),
+        )
+    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+        LOGGER.warning("[export] Failed to write segments success manifest: %s", manifest_exc)
+
+    return output_path
 
 
 def build_and_upload_debug_bundle(
