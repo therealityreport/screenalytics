@@ -260,6 +260,9 @@ def read_episode_status(ep_id: str, run_id: str) -> EpisodeStatus:
     run_id_norm = run_layout.normalize_run_id(run_id)
     payload = _read_status_payload(ep_id, run_id_norm)
     if payload is None:
+        _hydrate_status_from_s3(ep_id, run_id_norm)
+        payload = _read_status_payload(ep_id, run_id_norm)
+    if payload is None:
         status = derive_status_from_artifacts(ep_id, run_id_norm)
         return _reconcile_status_from_evidence(ep_id, run_id_norm, status)
     status = _episode_status_from_payload(ep_id, run_id_norm, payload)
@@ -273,6 +276,40 @@ def write_episode_status(ep_id: str, run_id: str, payload: Mapping[str, Any]) ->
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def _hydrate_status_from_s3(ep_id: str, run_id: str) -> None:
+    status_path = episode_status_path(ep_id, run_id)
+    if status_path.exists():
+        return
+    try:
+        from apps.api.services.storage import StorageService
+    except Exception as exc:  # pragma: no cover - optional dependency
+        LOGGER.debug("[episode_status] StorageService unavailable: %s", exc)
+        return
+    try:
+        storage = StorageService()
+    except Exception as exc:  # pragma: no cover - optional dependency
+        LOGGER.debug("[episode_status] StorageService init failed: %s", exc)
+        return
+    if not storage.s3_enabled():
+        return
+    for key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id, "episode_status.json"):
+        try:
+            payload = storage.download_bytes(key)
+        except Exception as exc:
+            LOGGER.debug("[episode_status] Failed to download %s: %s", key, exc)
+            continue
+        if not payload:
+            continue
+        try:
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_bytes(payload)
+        except OSError as exc:
+            LOGGER.debug("[episode_status] Failed to write hydrated status: %s", exc)
+        else:
+            LOGGER.info("[episode_status] Hydrated episode_status.json from %s", key)
+            return
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -621,6 +658,7 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
         allow_artifacts = current is None or current.status in {StageStatus.NOT_STARTED, StageStatus.RUNNING}
 
         manifest_payload, manifest_path = _stage_manifest_payload(ep_id, run_id, stage)
+        manifest_status = None
         if manifest_payload is not None:
             manifest_status = StageStatus.from_value(manifest_payload.get("status"))
             if manifest_status != StageStatus.NOT_STARTED and (allow_manifest or (current and current.status == StageStatus.BLOCKED)):
@@ -643,7 +681,8 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
                 for key, value in manifest_artifacts.items():
                     state.artifact_paths.setdefault(key, value)
                 status.stages[stage] = state
-                continue
+                if stage not in {Stage.PDF, Stage.SEGMENTS} or manifest_status != StageStatus.BLOCKED:
+                    continue
 
         artifacts = stage_artifacts(ep_id, run_id, stage.value)
         artifact_paths = {
@@ -653,15 +692,23 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
         }
         if not artifact_paths:
             continue
-        if allow_artifacts and stage in {Stage.PDF, Stage.SEGMENTS}:
+        if stage in {Stage.PDF, Stage.SEGMENTS}:
             if stage == Stage.PDF:
-                if "exports/run_debug.pdf" not in artifact_paths or "exports/export_index.json" not in artifact_paths:
+                if "exports/run_debug.pdf" not in artifact_paths:
                     continue
+            allow_artifacts = current is None or current.status in {
+                StageStatus.NOT_STARTED,
+                StageStatus.RUNNING,
+                StageStatus.BLOCKED,
+            }
+            if not allow_artifacts:
+                continue
             state = _ensure_stage_state(ep_id, run_id, stage, current)
             state.status = StageStatus.SUCCESS
             state.derived = True
             state.derived_from = list(artifact_paths.values())
             state.derivation_reason = "artifacts_present"
+            state.blocked_reason = None
             if state.finished_at is None:
                 paths = [Path(path) for path in artifact_paths.values()]
                 state.finished_at = _stage_artifact_mtime(paths)
@@ -964,8 +1011,8 @@ _ALLOWED_TRANSITIONS: dict[StageStatus, set[StageStatus]] = {
         StageStatus.BLOCKED,
     },
     StageStatus.SUCCESS: {StageStatus.SUCCESS},
-    StageStatus.FAILED: {StageStatus.FAILED},
-    StageStatus.BLOCKED: {StageStatus.BLOCKED},
+    StageStatus.FAILED: {StageStatus.FAILED, StageStatus.RUNNING},
+    StageStatus.BLOCKED: {StageStatus.BLOCKED, StageStatus.RUNNING},
 }
 
 
@@ -1016,10 +1063,22 @@ def _apply_stage_state(
         new_status=state.status,
         force=force,
     )
-    if existing_started and not force:
+    if existing_started and not force and state.status != StageStatus.RUNNING:
         state.started_at = existing_started
-    if existing_finished and not force:
+    if existing_finished and not force and state.status != StageStatus.RUNNING:
         state.finished_at = existing_finished
+    if state.status == StageStatus.RUNNING:
+        for key in (
+            "ended_at",
+            "finished_at",
+            "duration_s",
+            "blocked_reason",
+            "error_reason",
+            "error_code",
+            "timestamps",
+            "progress",
+        ):
+            existing_entry.pop(key, None)
     if state.started_at and state.finished_at and state.duration_s is None:
         state.duration_s = _duration_s(
             _serialize_datetime(state.started_at),

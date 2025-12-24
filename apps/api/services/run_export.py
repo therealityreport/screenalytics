@@ -3506,11 +3506,7 @@ def build_screentime_run_debug_pdf(
     }
     if include_screentime:
         stage_labels["screentime"] = "Screentime"
-    raw_plan = (
-        [str(item) for item in episode_status_payload.get("stage_plan", []) if isinstance(item, str)]
-        if isinstance(episode_status_payload, dict)
-        else []
-    )
+    raw_plan = [stage.value for stage in status.stage_plan] if status.stage_plan else []
     stage_plan: list[str] = []
     for item in raw_plan:
         normalized = normalize_stage_key(item)
@@ -3609,6 +3605,13 @@ def build_screentime_run_debug_pdf(
                 return None
         return None
 
+    def _job_dt(value: datetime | None) -> str | None:
+        if not value:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     job_rows = [_wrap_row(["Stage", "Status", "Started", "Ended", "Exit/Retry", "Last Log"], cell_style_small)]
     marker_map = {
         "detect": "detect_track.json",
@@ -3634,13 +3637,19 @@ def build_screentime_run_debug_pdf(
     }
     for stage_key in stage_plan:
         stage_entry = None
-        if isinstance(episode_status_payload, dict):
-            stage_entry = episode_status_payload.get("stages", {}).get(stage_key)
-        if not isinstance(stage_entry, dict):
-            stage_entry = {}
-        status_val = _resolve_lifecycle_status(stage_key, stage_entry, artifact_state_by_stage.get(stage_key, {}))
-        started_at = stage_entry.get("started_at")
-        ended_at = stage_entry.get("ended_at")
+        stage_state = status.stages.get(Stage.from_key(stage_key)) if Stage.from_key(stage_key) else None
+        if stage_state:
+            status_val = stage_state.status.value
+            started_at = _job_dt(stage_state.started_at)
+            ended_at = _job_dt(stage_state.finished_at)
+        else:
+            if isinstance(episode_status_payload, dict):
+                stage_entry = episode_status_payload.get("stages", {}).get(stage_key)
+            if not isinstance(stage_entry, dict):
+                stage_entry = {}
+            status_val = _resolve_lifecycle_status(stage_key, stage_entry, artifact_state_by_stage.get(stage_key, {}))
+            started_at = stage_entry.get("started_at")
+            ended_at = stage_entry.get("ended_at")
         if not started_at and not ended_at:
             marker_name = marker_map.get(stage_key)
             if marker_name:
@@ -6243,9 +6252,48 @@ def build_and_upload_debug_pdf(
     return pdf_bytes, download_name, upload_result
 
 
+def _ensure_local_run_artifact(ep_id: str, run_id: str, rel_path: str) -> Path:
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    run_root = run_layout.run_root(ep_id, run_id_norm)
+    local_path = run_root / rel_path
+    if local_path.exists():
+        return local_path
+    try:
+        from apps.api.services.storage import StorageService
+    except Exception as exc:  # pragma: no cover - optional dependency
+        LOGGER.debug("[export] StorageService unavailable for hydrate: %s", exc)
+        return local_path
+
+    try:
+        storage = StorageService()
+    except Exception as exc:  # pragma: no cover - optional dependency
+        LOGGER.debug("[export] StorageService init failed for hydrate: %s", exc)
+        return local_path
+
+    if not storage.s3_enabled():
+        return local_path
+
+    for key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, rel_path):
+        try:
+            payload = storage.download_bytes(key)
+        except Exception as exc:
+            LOGGER.debug("[export] Failed to download %s: %s", key, exc)
+            continue
+        if not payload:
+            continue
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(payload)
+        except OSError as exc:
+            LOGGER.debug("[export] Failed to write hydrated artifact %s: %s", local_path, exc)
+        else:
+            LOGGER.info("[export] Hydrated %s from %s", rel_path, key)
+            return local_path
+    return local_path
+
+
 def _segments_source_path(ep_id: str, run_id: str) -> Path:
-    run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
-    return run_root / "body_tracking" / "screentime_comparison.json"
+    return _ensure_local_run_artifact(ep_id, run_id, "body_tracking/screentime_comparison.json")
 
 
 def _coerce_float(value: Any) -> float | None:

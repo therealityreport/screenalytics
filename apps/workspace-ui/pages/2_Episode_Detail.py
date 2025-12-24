@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import sys
 import time
 import uuid
@@ -33,7 +32,7 @@ import episode_detail_layout as stage_layout  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
 from py_screenalytics import run_layout  # noqa: E402
-from py_screenalytics.episode_status import read_episode_status, stage_artifacts  # noqa: E402
+from py_screenalytics.episode_status import StageStatus, read_episode_status, stage_artifacts  # noqa: E402
 from py_screenalytics.run_gates import check_prereqs  # noqa: E402
 from py_screenalytics import run_logs  # noqa: E402
 
@@ -3786,6 +3785,14 @@ def _latest_run_id_by_mtime(ep_id: str) -> str | None:
     return latest_run_id
 
 
+def _run_is_active(ep_id: str, run_id: str) -> bool:
+    try:
+        status = read_episode_status(ep_id, run_id)
+    except Exception:
+        return False
+    return any(state.status == StageStatus.RUNNING for state in status.stages.values())
+
+
 with st.expander("Recent Attempts", expanded=False):
     recent_runs: list[dict[str, Any]] = []
     for run_id in run_layout.list_run_ids(ep_id):
@@ -3831,6 +3838,12 @@ with st.expander("Recent Attempts", expanded=False):
         for entry in recent_runs:
             run_id = entry["run_id"]
             run_root = run_layout.run_root(ep_id, run_id)
+            run_layout_info = run_layout.get_run_s3_layout(ep_id, run_id)
+            prefix_candidates = [
+                prefix for prefix in [run_layout_info.canonical_prefix, run_layout_info.legacy_prefix] if prefix
+            ]
+            prefix_label = ", ".join(prefix_candidates)
+            run_active = _run_is_active(ep_id, run_id)
             status_path = run_root / "episode_status.json"
             updated_iso = None
             if status_path.exists():
@@ -3845,8 +3858,12 @@ with st.expander("Recent Attempts", expanded=False):
             updated_label = _format_timestamp(updated_iso) or "—"
             row_cols = st.columns([3, 4, 2, 1, 1, 1])
             row_cols[0].code(run_id)
+            if prefix_label:
+                row_cols[0].caption(f"S3: `{prefix_label}`")
             row_cols[1].caption(entry["completed"])
             row_cols[2].caption(updated_label)
+            if run_active:
+                row_cols[2].caption("⏳ Running")
             if row_cols[3].button(
                 "Select",
                 key=f"{ep_id}::select_recent_attempt::{run_id}",
@@ -3860,14 +3877,14 @@ with st.expander("Recent Attempts", expanded=False):
                 "Confirm",
                 key=confirm_key,
                 label_visibility="collapsed",
-                help=f"Confirm deletion of {run_id}",
+                help=f"Confirm deletion of {run_id} (local: {run_root}, s3: {prefix_label or 'unavailable'})",
                 disabled=job_running,
             )
             if row_cols[5].button(
                 "Delete",
                 key=f"{ep_id}::delete_attempt::{run_id}",
                 use_container_width=True,
-                disabled=job_running or not confirm_delete,
+                disabled=job_running or not confirm_delete or run_active,
             ):
                 try:
                     from apps.api.services.run_artifact_store import delete_run
@@ -3920,28 +3937,19 @@ if ep_id == "rhoslc-s06e11":
     ):
         with st.spinner("Deleting run-scoped attempt artifacts..."):
             try:
-                runs_dir = run_layout.runs_root(ep_id)
-                frames_runs_dir = get_path(ep_id, "frames_root") / "runs"
+                from apps.api.services.run_artifact_store import delete_run
 
-                removed_dirs = 0
-                removed_files = 0
-
-                if runs_dir.exists():
-                    for child in list(runs_dir.iterdir()):
-                        try:
-                            if child.is_dir():
-                                shutil.rmtree(child)
-                                removed_dirs += 1
-                            else:
-                                child.unlink()
-                                removed_files += 1
-                        except Exception as exc:
-                            LOGGER.warning("Failed to remove %s: %s", child, exc)
-
-                if frames_runs_dir.exists():
-                    shutil.rmtree(frames_runs_dir)
-
-                runs_dir.mkdir(parents=True, exist_ok=True)
+                removed_runs = 0
+                skipped_runs = 0
+                for run_id in run_layout.list_run_ids(ep_id):
+                    try:
+                        delete_result = delete_run(ep_id, run_id, delete_local=True, delete_remote=True)
+                        removed_runs += 1
+                        if delete_result.skipped:
+                            skipped_runs += 1
+                    except Exception as exc:
+                        LOGGER.warning("Failed to delete run %s: %s", run_id, exc)
+                        skipped_runs += 1
 
                 # Reset attempt selection + status caches
                 st.session_state[_active_run_id_pending_key] = ""
@@ -3962,9 +3970,7 @@ if ep_id == "rhoslc-s06e11":
                     pass
 
                 helpers.invalidate_running_jobs_cache(ep_id)
-                st.success(
-                    f"Cleared {removed_dirs} run directories and {removed_files} run marker files for `{ep_id}`."
-                )
+                st.success(f"Cleared {removed_runs} runs for `{ep_id}` (skipped: {skipped_runs}).")
                 time.sleep(0.25)
                 st.rerun()
             except (RerunException, StopException):

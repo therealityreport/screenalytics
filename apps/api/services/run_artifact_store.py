@@ -158,10 +158,12 @@ def delete_run(
     *,
     delete_local: bool = True,
     delete_remote: bool = True,
+    force: bool = False,
 ) -> DeleteResult:
     """Delete all run-scoped artifacts for a given episode/run_id."""
     from apps.api.services.storage import delete_local_tree
     from apps.api.services.storage_backend import get_storage_backend
+    from py_screenalytics.episode_status import StageStatus, read_episode_status
 
     result = DeleteResult()
     run_id_norm = run_layout.normalize_run_id(run_id)
@@ -177,6 +179,16 @@ def delete_run(
     frames_run_root = frames_runs_root / run_id_norm
     if frames_run_root.exists():
         _guard_child_path(frames_runs_root, frames_run_root, label="frames_run_root")
+
+    if not force:
+        try:
+            status = read_episode_status(ep_id, run_id_norm)
+            if any(state.status == StageStatus.RUNNING for state in status.stages.values()):
+                raise RuntimeError(f"Refusing to delete active run {run_id_norm}; stop the run or force delete.")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            LOGGER.debug("[run-delete] Unable to determine run status for %s/%s: %s", ep_id, run_id_norm, exc)
 
     if delete_local:
         if run_root.exists():

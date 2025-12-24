@@ -3,6 +3,7 @@ from __future__ import annotations
 from apps.api.services.run_artifact_store import delete_run
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
+from py_screenalytics.episode_status import write_stage_started
 
 
 def test_delete_run_local_wipes_tree(tmp_path, monkeypatch) -> None:
@@ -50,3 +51,20 @@ def test_delete_run_skips_episode_scoped_frames(tmp_path, monkeypatch) -> None:
         and entry.get("reason") == "episode_scoped_shared"
         for entry in result.skipped
     )
+
+
+def test_delete_run_refuses_active_run(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "demo-s01e01"
+    run_id = "Attempt3_2025-12-23_000000EST"
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    write_stage_started(ep_id, run_id, "detect")
+
+    try:
+        delete_run(ep_id, run_id, delete_remote=False)
+    except RuntimeError as exc:
+        assert "Refusing to delete active run" in str(exc)
+    else:
+        raise AssertionError("Expected active run deletion to be refused")

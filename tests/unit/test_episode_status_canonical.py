@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from py_screenalytics import run_layout
@@ -104,6 +105,26 @@ def test_pdf_reconciles_running_when_exports_exist(tmp_path: Path, monkeypatch) 
     assert pdf_state.finished_at is not None
 
 
+def test_pdf_reconciles_blocked_when_exports_exist(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-pdf-blocked"
+    run_id = "attempt-9"
+    run_root = run_layout.run_root(ep_id, run_id)
+    (run_root / "exports").mkdir(parents=True, exist_ok=True)
+    (run_root / "exports" / "run_debug.pdf").write_bytes(b"%PDF-1.4 test")
+    (run_root / "exports" / "export_index.json").write_text("{}", encoding="utf-8")
+
+    blocked_reason = BlockedReason(code="missing", message="missing prereq", details=None)
+    write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
+
+    status = read_episode_status(ep_id, run_id)
+    pdf_state = status.stages[Stage.PDF]
+    assert pdf_state.status == StageStatus.SUCCESS
+    assert pdf_state.blocked_reason is None
+
+
 def test_episode_status_lost_update_protection(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
@@ -140,6 +161,55 @@ def test_episode_status_monotonic_transition(tmp_path: Path, monkeypatch) -> Non
         write_stage_started(ep_id, run_id, "detect")
 
     assert excinfo.value.code == "status_regression"
+
+
+def test_stage_start_resets_terminal_fields(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-reset"
+    run_id = "attempt-10"
+    blocked_reason = BlockedReason(code="missing", message="missing input", details=None)
+
+    write_stage_blocked(ep_id, run_id, "detect", blocked_reason)
+    status_blocked = read_episode_status(ep_id, run_id)
+    assert status_blocked.stages[Stage.DETECT].status == StageStatus.BLOCKED
+    assert status_blocked.stages[Stage.DETECT].finished_at is not None
+
+    write_stage_started(ep_id, run_id, "detect")
+    status_running = read_episode_status(ep_id, run_id)
+    detect_state = status_running.stages[Stage.DETECT]
+    assert detect_state.status == StageStatus.RUNNING
+    assert detect_state.finished_at is None
+    assert detect_state.blocked_reason is None
+
+    finished_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+    write_stage_finished(ep_id, run_id, "detect", finished_at=finished_at)
+    status_done = read_episode_status(ep_id, run_id)
+    detect_done = status_done.stages[Stage.DETECT]
+    assert detect_done.started_at is not None
+    assert detect_done.finished_at is not None
+    assert detect_done.started_at <= detect_done.finished_at
+
+
+def test_pdf_timestamps_monotonic(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-pdf-times"
+    run_id = "attempt-11"
+    blocked_reason = BlockedReason(code="missing", message="missing prereq", details=None)
+
+    write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
+    write_stage_started(ep_id, run_id, "pdf")
+    finished_at = datetime.now(timezone.utc) + timedelta(seconds=10)
+    write_stage_finished(ep_id, run_id, "pdf", finished_at=finished_at)
+
+    status = read_episode_status(ep_id, run_id)
+    pdf_state = status.stages[Stage.PDF]
+    assert pdf_state.started_at is not None
+    assert pdf_state.finished_at is not None
+    assert pdf_state.started_at <= pdf_state.finished_at
 
 
 def test_stage_blocked_idempotent(tmp_path: Path, monkeypatch) -> None:

@@ -124,6 +124,57 @@ def test_run_segments_export_blocks_when_missing_segments(tmp_path: Path, monkey
     assert str(manifest.get("status", "")).lower() == "blocked"
 
 
+def test_run_segments_export_hydrates_from_s3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pandas = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    sys.path.insert(0, str(PROJECT_ROOT))
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+
+    from py_screenalytics import run_layout
+    from py_screenalytics.episode_status import Stage, StageStatus, read_episode_status
+    from apps.api.services import storage as storage_module
+    from apps.api.services.run_export import run_segments_export
+
+    payload = {
+        "summary": {"total_identities": 1},
+        "breakdowns": [
+            {
+                "identity_id": "id1",
+                "breakdown": {"body_only_duration": 1.0},
+                "body_only_segments": [
+                    {"start_time": 0.0, "end_time": 1.0, "duration": 1.0, "segment_type": "body"},
+                ],
+            },
+        ],
+    }
+    payload_bytes = json.dumps(payload).encode("utf-8")
+
+    class FakeStorage:
+        def s3_enabled(self) -> bool:
+            return True
+
+        def download_bytes(self, key: str) -> bytes | None:
+            if "screentime_comparison.json" in key:
+                return payload_bytes
+            return None
+
+    monkeypatch.setattr(storage_module, "StorageService", FakeStorage)
+
+    ep_id = "ep-hydrate"
+    run_id = "run-hydrate"
+    run_layout.run_root(ep_id, run_id).mkdir(parents=True, exist_ok=True)
+
+    output_path = run_segments_export(ep_id=ep_id, run_id=run_id)
+    assert output_path is not None
+    assert output_path.exists()
+
+    status = read_episode_status(ep_id, run_id)
+    state = status.stages.get(Stage.SEGMENTS)
+    assert state is not None
+    assert state.status == StageStatus.SUCCESS
+    assert pandas.read_parquet(output_path).shape[0] > 0
+
+
 def test_run_segments_export_reconciliation_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
