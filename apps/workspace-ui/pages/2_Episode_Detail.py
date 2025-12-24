@@ -2702,6 +2702,12 @@ def _canonical_stage_entry(
     if not isinstance(stages, dict):
         return None
     entry = stages.get(stage_key)
+    if isinstance(entry, dict):
+        return entry
+    resolved_key = stage_layout.resolve_stage_key(stage_key, stages.keys())
+    if not resolved_key:
+        return None
+    entry = stages.get(resolved_key)
     return entry if isinstance(entry, dict) else None
 
 
@@ -2713,10 +2719,17 @@ def _canonical_stage_status(
     if not entry:
         return None
     status_value = entry.get("status")
+    derived = bool(entry.get("derived") or entry.get("is_derived"))
+    derived_paths = entry.get("derived_from") or entry.get("artifact_paths")
+    has_evidence = bool(derived_paths)
     if not status_value:
+        if derived and has_evidence:
+            return "success"
         return None
     normalized = str(status_value).strip().lower()
     if normalized in {"not_started", "missing", "unknown"}:
+        if derived and has_evidence:
+            return "success"
         return "missing"
     if normalized in {"error"}:
         return "failed"
@@ -2738,6 +2751,12 @@ def _canonical_stage_error(entry: dict[str, Any] | None) -> str | None:
         if code:
             return code
     return None
+
+
+def _canonical_stage_is_derived(entry: dict[str, Any] | None) -> bool:
+    if not entry:
+        return False
+    return bool(entry.get("derived") or entry.get("is_derived"))
 
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
@@ -4034,6 +4053,8 @@ with col1:
     if detect_status_value == "success":
         runtime_label = detect_runtime or "n/a"
         st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
+        if _canonical_stage_is_derived(canonical_stage_entries.get("detect")):
+            st.caption("Derived from run-scoped manifests/artifacts.")
         det = detect_phase_status.get("detector") or "--"
         trk = detect_phase_status.get("tracker") or "--"
         st.caption(f"{det} + {trk}")
