@@ -3736,6 +3736,20 @@ if isinstance(api_active_run_id, str) and api_active_run_id.strip():
     if api_active_run_id.strip() != selected_attempt_label:
         st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
 
+
+def _latest_run_id_by_mtime(ep_id: str) -> str | None:
+    latest_run_id = None
+    latest_mtime = 0.0
+    for run_id in run_layout.list_run_ids(ep_id):
+        run_root = run_layout.run_root(ep_id, run_id)
+        status_path = run_root / "episode_status.json"
+        mtime = _safe_mtime(status_path) or _safe_mtime(run_root)
+        if mtime and mtime >= latest_mtime:
+            latest_mtime = mtime
+            latest_run_id = run_id
+    return latest_run_id
+
+
 with st.expander("Recent Attempts", expanded=False):
     recent_runs: list[dict[str, Any]] = []
     for run_id in run_layout.list_run_ids(ep_id):
@@ -3771,11 +3785,13 @@ with st.expander("Recent Attempts", expanded=False):
     if not recent_runs:
         st.caption("No previous attempts found.")
     else:
-        header_cols = st.columns([3, 4, 2, 1])
+        header_cols = st.columns([3, 4, 2, 1, 1, 1])
         header_cols[0].caption("Run ID")
         header_cols[1].caption("Completed stages")
         header_cols[2].caption("Last update")
-        header_cols[3].caption("")
+        header_cols[3].caption("Select")
+        header_cols[4].caption("Confirm")
+        header_cols[5].caption("Delete")
         for entry in recent_runs:
             run_id = entry["run_id"]
             run_root = run_layout.run_root(ep_id, run_id)
@@ -3791,7 +3807,7 @@ with st.expander("Recent Attempts", expanded=False):
                         .replace("+00:00", "Z")
                     )
             updated_label = _format_timestamp(updated_iso) or "—"
-            row_cols = st.columns([3, 4, 2, 1])
+            row_cols = st.columns([3, 4, 2, 1, 1, 1])
             row_cols[0].code(run_id)
             row_cols[1].caption(entry["completed"])
             row_cols[2].caption(updated_label)
@@ -3803,6 +3819,53 @@ with st.expander("Recent Attempts", expanded=False):
                 st.session_state[_active_run_id_pending_key] = run_id
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
+            confirm_key = f"{ep_id}::confirm_delete_attempt::{run_id}"
+            confirm_delete = row_cols[4].checkbox(
+                "Confirm",
+                key=confirm_key,
+                label_visibility="collapsed",
+                help=f"Confirm deletion of {run_id}",
+                disabled=job_running,
+            )
+            if row_cols[5].button(
+                "Delete",
+                key=f"{ep_id}::delete_attempt::{run_id}",
+                use_container_width=True,
+                disabled=job_running or not confirm_delete,
+            ):
+                try:
+                    from apps.api.services.run_artifact_store import delete_run
+
+                    with st.spinner(f"Deleting run {run_id}..."):
+                        delete_result = delete_run(ep_id, run_id, delete_local=True, delete_remote=True)
+                    st.session_state.pop(confirm_key, None)
+                    if selected_attempt_run_id == run_id:
+                        next_run = _latest_run_id_by_mtime(ep_id)
+                        st.session_state[_active_run_id_pending_key] = next_run or ""
+                    st.session_state[_status_force_refresh_key(ep_id)] = True
+                    st.session_state.pop(status_cache_key, None)
+                    st.session_state.pop(mtimes_key, None)
+                    skipped = delete_result.skipped or []
+                    skipped_shared = [
+                        entry for entry in skipped if entry.get("reason") == "episode_scoped_shared"
+                    ]
+                    st.success(f"Deleted run-scoped artifacts for `{run_id}`.")
+                    if skipped_shared:
+                        st.warning(
+                            "Shared episode-scoped frames/crops were not deleted "
+                            "(legacy paths are shared across runs)."
+                        )
+                    other_skips = [
+                        entry for entry in skipped if entry.get("reason") != "episode_scoped_shared"
+                    ]
+                    if other_skips:
+                        st.caption(f"Skipped: {len(other_skips)} entries (see logs for details).")
+                    st.rerun()
+                except (RerunException, StopException):
+                    raise
+                except Exception as exc:
+                    st.error(f"Failed to delete run `{run_id}`.")
+                    st.exception(exc)
 
 if ep_id == "rhoslc-s06e11":
     st.divider()
