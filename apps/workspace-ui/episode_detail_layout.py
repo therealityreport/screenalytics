@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+from py_screenalytics import run_layout
 
 PIPELINE_STAGE_PLAN: tuple[str, ...] = (
     "detect",
@@ -70,6 +74,16 @@ class ArtifactPresence:
     s3_key: str | None = None
 
 
+@dataclass(frozen=True)
+class RunDebugPdfInfo:
+    episode_id: str
+    run_id: str
+    local_path: Path
+    exists: bool
+    export_index: dict[str, Any] | None = None
+    s3_key: str | None = None
+
+
 def normalize_stage_key(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -94,6 +108,68 @@ def resolve_stage_key(stage_key: str | None, available: Iterable[str]) -> str | 
             return candidate
     return None
 
+
+def canonical_status_from_entry(entry: Mapping[str, Any] | None) -> str | None:
+    if not entry:
+        return None
+    status_value = entry.get("status")
+    derived = bool(entry.get("derived") or entry.get("is_derived"))
+    derived_paths = entry.get("derived_from") or entry.get("artifact_paths")
+    has_evidence = bool(derived_paths)
+    if not status_value:
+        if derived and has_evidence:
+            return "success"
+        return None
+    normalized = str(status_value).strip().lower()
+    if normalized in {"not_started", "missing", "unknown"}:
+        if derived and has_evidence:
+            return "success"
+        return "missing"
+    if normalized in {"error"}:
+        return "failed"
+    return normalized
+
+
+def resolve_run_debug_pdf(
+    ep_id: str,
+    run_id: str,
+    stage_entry: Mapping[str, Any] | None = None,
+) -> RunDebugPdfInfo:
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    run_root = run_layout.run_root(ep_id, run_id_norm)
+    local_path = run_root / "exports" / "run_debug.pdf"
+    export_index: dict[str, Any] | None = None
+    s3_key: str | None = None
+
+    if stage_entry:
+        artifact_paths = stage_entry.get("artifact_paths")
+        if isinstance(artifact_paths, Mapping):
+            candidate = artifact_paths.get("exports/run_debug.pdf")
+            if isinstance(candidate, str) and candidate.strip():
+                local_path = Path(candidate)
+
+    index_path = run_root / "exports" / "export_index.json"
+    if index_path.exists():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            export_index = payload
+            export_upload = payload.get("export_upload")
+            if isinstance(export_upload, dict):
+                s3_key = export_upload.get("s3_key")
+            if not s3_key:
+                s3_key = payload.get("export_s3_key")
+
+    return RunDebugPdfInfo(
+        episode_id=ep_id,
+        run_id=run_id_norm,
+        local_path=local_path,
+        exists=local_path.exists(),
+        export_index=export_index,
+        s3_key=s3_key if isinstance(s3_key, str) and s3_key.strip() else None,
+    )
 
 def stage_label(stage_key: str | None) -> str:
     if not stage_key:

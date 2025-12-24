@@ -165,6 +165,10 @@ def _trigger_pdf_export_if_needed(
     """
     from apps.api.services.run_artifact_store import read_export_index
 
+    pdf_info = stage_layout.resolve_run_debug_pdf(ep_id, run_id)
+    if pdf_info.exists and not force:
+        return True, f"PDF already exported (local): {pdf_info.local_path}"
+
     # Idempotency check: skip if PDF already exported for this run
     if not force:
         try:
@@ -216,6 +220,61 @@ def _trigger_pdf_export_if_needed(
     else:
         LOGGER.info("[PDF-EXPORT] Export generated (local storage)")
         return True, "PDF exported (local storage)"
+
+
+def _render_pdf_view_download(
+    *,
+    ep_id: str,
+    run_id: str,
+    stage_entry: dict[str, Any] | None,
+    key_prefix: str,
+    show_path: bool = True,
+    use_container_width: bool = False,
+) -> stage_layout.RunDebugPdfInfo:
+    pdf_info = stage_layout.resolve_run_debug_pdf(ep_id, run_id, stage_entry)
+    if not pdf_info.exists:
+        return pdf_info
+    try:
+        size_bytes = pdf_info.local_path.stat().st_size
+    except OSError:
+        size_bytes = None
+    if show_path:
+        size_label = helpers.human_size(size_bytes) if size_bytes is not None else "?"
+        st.caption(f"PDF: {size_label} · `{pdf_info.local_path}`")
+    pdf_url = helpers.ensure_media_url(str(pdf_info.local_path))
+    pdf_bytes: bytes | None = None
+    try:
+        pdf_bytes = pdf_info.local_path.read_bytes()
+    except OSError:
+        pdf_bytes = None
+    download_name = f"screenalytics_{ep_id}_{run_id}_debug_report.pdf"
+    view_col, download_col = st.columns(2)
+    with view_col:
+        if pdf_url:
+            st.markdown(
+                f'<a href="{pdf_url}" target="_blank" rel="noopener noreferrer">View PDF</a>',
+                unsafe_allow_html=True,
+            )
+        elif pdf_bytes is not None:
+            st.download_button(
+                "View PDF",
+                data=pdf_bytes,
+                file_name=download_name,
+                mime="application/pdf",
+                key=f"{key_prefix}::view_pdf",
+                use_container_width=use_container_width,
+            )
+    with download_col:
+        if pdf_bytes is not None:
+            st.download_button(
+                "Download PDF",
+                data=pdf_bytes,
+                file_name=download_name,
+                mime="application/pdf",
+                key=f"{key_prefix}::download_pdf",
+                use_container_width=use_container_width,
+            )
+    return pdf_info
 
 
 def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | None) -> None:
@@ -2716,24 +2775,7 @@ def _canonical_stage_status(
     stage_key: str,
 ) -> str | None:
     entry = _canonical_stage_entry(status_payload, stage_key)
-    if not entry:
-        return None
-    status_value = entry.get("status")
-    derived = bool(entry.get("derived") or entry.get("is_derived"))
-    derived_paths = entry.get("derived_from") or entry.get("artifact_paths")
-    has_evidence = bool(derived_paths)
-    if not status_value:
-        if derived and has_evidence:
-            return "success"
-        return None
-    normalized = str(status_value).strip().lower()
-    if normalized in {"not_started", "missing", "unknown"}:
-        if derived and has_evidence:
-            return "success"
-        return "missing"
-    if normalized in {"error"}:
-        return "failed"
-    return normalized
+    return stage_layout.canonical_status_from_entry(entry)
 
 
 def _canonical_stage_error(entry: dict[str, Any] | None) -> str | None:
@@ -3952,25 +3994,19 @@ with action_col1:
             st.session_state[autorun_rerun_requested_key] = True
             st.rerun()
 with action_col2:
-    pdf_header_disabled = (
-        job_running
-        or not selected_attempt_run_id
-        or pdf_export_status_value == "running"
-    )
-    if st.button(
-        "📄 Export Debug PDF",
-        key=f"{ep_id}::export_pdf_header",
-        use_container_width=True,
-        disabled=pdf_header_disabled,
-    ):
-        with st.spinner("Generating PDF report..."):
-            ok, msg = _trigger_pdf_export_if_needed(ep_id, selected_attempt_run_id, cfg)
-        if not ok:
-            st.error(msg)
-        else:
-            st.success(msg)
-            st.session_state[_status_force_refresh_key(ep_id)] = True
-            st.rerun()
+    if selected_attempt_run_id:
+        pdf_info = _render_pdf_view_download(
+            ep_id=ep_id,
+            run_id=selected_attempt_run_id,
+            stage_entry=canonical_stage_entries.get("pdf"),
+            key_prefix=f"{ep_id}::{selected_attempt_run_id}::pdf_header",
+            show_path=False,
+            use_container_width=True,
+        )
+        if not pdf_info.exists:
+            st.caption("Use **PDF Export** below to generate the debug report.")
+    else:
+        st.caption("Select a run_id to view the debug PDF.")
 with action_col3:
     if setup_complete:
         if st.button(
@@ -4668,6 +4704,15 @@ with row2_col3:
         st.caption(f"Run Duration: {pdf_export_runtime}")
     elif pdf_export_status_value == "success":
         st.caption("Run Duration: n/a")
+    if selected_attempt_run_id:
+        _render_pdf_view_download(
+            ep_id=ep_id,
+            run_id=selected_attempt_run_id,
+            stage_entry=canonical_stage_entries.get("pdf"),
+            key_prefix=f"{ep_id}::{selected_attempt_run_id}::pdf_export_card",
+            show_path=True,
+            use_container_width=True,
+        )
 
     pdf_btn_label = "Re-export PDF" if pdf_export_status_value == "success" else "Export PDF"
     pdf_btn_disabled = (
@@ -5799,7 +5844,12 @@ def _autorun_drive_downstream(run_id: str) -> None:
         st.rerun()
 
     if phase_now == "pdf":
-        if pdf_export_status_value == "success":
+        pdf_info = stage_layout.resolve_run_debug_pdf(
+            ep_id,
+            run_id,
+            canonical_stage_entries.get("pdf"),
+        )
+        if pdf_export_status_value == "success" and pdf_info.exists:
             _autorun_append_completed("PDF Export")
             # Finalize auto-run only when all enabled stages are complete for this run_id.
             st.session_state[_autorun_key] = False
@@ -5816,9 +5866,12 @@ def _autorun_drive_downstream(run_id: str) -> None:
             completion_label = " · ".join(completion_bits)
             st.success(f"🎉 **Setup Pipeline Complete!** ({completion_label})")
             st.rerun()
+        if pdf_export_status_value == "running":
+            return
 
+        force_export = pdf_export_status_value == "success" and not pdf_info.exists
         with st.spinner("Generating PDF report..."):
-            ok, msg = _trigger_pdf_export_if_needed(ep_id, run_id, cfg)
+            ok, msg = _trigger_pdf_export_if_needed(ep_id, run_id, cfg, force=force_export)
         if not ok:
             _autorun_stop("PDF Export", msg)
             return
@@ -7655,6 +7708,15 @@ with row3_col3:
         st.caption(f"Run Duration: {pdf_export_runtime}")
     elif pdf_export_status_value == "success":
         st.caption("Run Duration: n/a")
+    if selected_attempt_run_id:
+        _render_pdf_view_download(
+            ep_id=ep_id,
+            run_id=selected_attempt_run_id,
+            stage_entry=canonical_stage_entries.get("pdf"),
+            key_prefix=f"{ep_id}::{selected_attempt_run_id}::pdf_export_panel",
+            show_path=True,
+            use_container_width=True,
+        )
 
     pdf_btn_label = "Re-export PDF" if pdf_export_status_value == "success" else "Export PDF"
     pdf_btn_disabled = (
@@ -7708,81 +7770,16 @@ if not selected_attempt_run_id:
     st.info("Select a non-legacy attempt (run_id) to export a run debug report.")
 else:
     st.caption(f"Exporting run_id: `{selected_attempt_run_id}`")
-    opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
-
-    export_state_key = f"{opt_key_prefix}::payload"
-    export_clicked = st.button(
-        "Generate PDF Report",
-        key=f"{opt_key_prefix}::export",
-        type="primary",
+    pdf_info = _render_pdf_view_download(
+        ep_id=ep_id,
+        run_id=selected_attempt_run_id,
+        stage_entry=canonical_stage_entries.get("pdf"),
+        key_prefix=f"{ep_id}::{selected_attempt_run_id}::debug_export_pdf",
+        show_path=True,
         use_container_width=False,
-        help="Generate a Screen Time Run Debug Report PDF with pipeline stats and artifact manifest",
     )
-    if export_clicked:
-        with st.spinner("Generating PDF report…"):
-            url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
-            try:
-                resp = requests.get(url, params={"include_screentime": "false"}, timeout=300)
-                resp.raise_for_status()
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error(url, exc))
-            else:
-                content_disp = resp.headers.get("Content-Disposition", "") or ""
-                filename = None
-                if "filename=" in content_disp:
-                    filename = content_disp.split("filename=", 1)[1].strip().strip('"')
-                if not filename:
-                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
-
-                # Check S3 upload status from response headers
-                s3_upload_attempted = resp.headers.get("X-S3-Upload-Attempted", "").lower() == "true"
-                s3_upload_success = resp.headers.get("X-S3-Upload-Success", "").lower() == "true"
-                s3_upload_key = resp.headers.get("X-S3-Upload-Key")
-                s3_upload_error = resp.headers.get("X-S3-Upload-Error")
-
-                st.session_state[export_state_key] = {
-                    "filename": filename,
-                    "bytes": resp.content,
-                    "s3_upload_attempted": s3_upload_attempted,
-                    "s3_upload_success": s3_upload_success,
-                    "s3_upload_key": s3_upload_key,
-                    "s3_upload_error": s3_upload_error,
-                }
-
-    bundle = st.session_state.get(export_state_key)
-    if isinstance(bundle, dict) and bundle.get("bytes"):
-        file_bytes = bundle.get("bytes") or b""
-        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
-        try:
-            st.caption(f"Report ready: {len(file_bytes) / 1024:.1f} KB")
-        except Exception:
-            pass
-
-        # Display S3 upload status
-        s3_upload_attempted = bundle.get("s3_upload_attempted", False)
-        s3_upload_success = bundle.get("s3_upload_success", False)
-        s3_upload_key = bundle.get("s3_upload_key")
-        s3_upload_error = bundle.get("s3_upload_error")
-        if s3_upload_attempted:
-            if s3_upload_success and s3_upload_key:
-                st.success(f"✅ Saved to S3: `{s3_upload_key}`")
-            elif s3_upload_error:
-                st.warning(f"⚠️ S3 upload attempted but failed: {s3_upload_error}")
-            else:
-                st.warning("⚠️ S3 upload attempted but status unknown")
-        else:
-            st.info("S3 upload not attempted (local backend or disabled)")
-        st.download_button(
-            "Download PDF",
-            data=file_bytes,
-            file_name=filename,
-            mime="application/pdf",
-            key=f"{opt_key_prefix}::download",
-            use_container_width=False,
-        )
-        if st.button("Clear", key=f"{opt_key_prefix}::clear_bundle"):
-            st.session_state.pop(export_state_key, None)
-            st.rerun()
+    if not pdf_info.exists:
+        st.info("No debug PDF found yet. Use **PDF Export** above to generate it.")
 
 def _render_artifact_entry(
     label: str,
