@@ -52,3 +52,13 @@ def test_resolve_run_debug_pdf(tmp_path, monkeypatch) -> None:
 
     missing_info = layout.resolve_run_debug_pdf(ep_id, "Attempt2_2025-12-23_000000EST", stage_entry=None)
     assert not missing_info.exists
+
+    export_index = run_root / "exports" / "export_index.json"
+    export_index.write_text(
+        '{"export_s3_key": "runs/demo/s01/e01/Attempt1_2025-12-23_000000EST/exports/debug_report.pdf"}',
+        encoding="utf-8",
+    )
+    (run_root / "exports" / "run_debug.pdf").unlink()
+    remote_info = layout.resolve_run_debug_pdf(ep_id, run_id, stage_entry=None)
+    assert not remote_info.exists
+    assert remote_info.s3_key

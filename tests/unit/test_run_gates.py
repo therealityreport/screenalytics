@@ -63,5 +63,22 @@ def test_gate_reconciles_upstream_artifacts(tmp_path, monkeypatch) -> None:
     _touch(run_root / "faces.jsonl")
     _touch(run_root / "body_tracking" / "body_tracks.jsonl")
 
+    write_stage_finished(ep_id, run_id, "faces")
+    write_stage_finished(ep_id, run_id, "body_tracking")
+
     gate = check_prereqs("track_fusion", ep_id, run_id, config={"body_tracking": {"enabled": True}})
     assert gate.ok
+
+
+def test_gate_pdf_requires_track_fusion(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "rhobh-s01e03"
+    run_id = run_layout.get_or_create_run_id(ep_id, None)
+
+    gate = check_prereqs("pdf", ep_id, run_id)
+    assert not gate.ok
+    assert any(reason.code == "upstream_not_success" for reason in gate.reasons)
+
+    write_stage_finished(ep_id, run_id, "track_fusion")
+    gate_ok = check_prereqs("pdf", ep_id, run_id)
+    assert gate_ok.ok

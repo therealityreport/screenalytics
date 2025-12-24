@@ -62,3 +62,26 @@ def test_generate_run_debug_pdf_missing_data(tmp_path: Path, monkeypatch: pytest
     pdf_path = generate_run_debug_pdf(ep_id, run_id)
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 0
+
+
+def test_run_header_times_monotonic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+
+    from py_screenalytics.episode_status import read_episode_status, write_stage_finished, write_stage_started
+    from apps.api.services.run_export import _compute_run_header_times
+
+    ep_id = "ep-header-times"
+    run_id = "run789"
+    started_at = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2025, 1, 1, 12, 5, tzinfo=timezone.utc)
+
+    write_stage_started(ep_id, run_id, "detect", started_at=started_at)
+    write_stage_finished(ep_id, run_id, "detect", finished_at=finished_at)
+
+    status = read_episode_status(ep_id, run_id)
+    payload = {"generated_at": "2025-01-01T12:00:00Z"}
+    run_started, run_finished, generated_at = _compute_run_header_times(status, payload)
+
+    assert run_started == started_at
+    assert run_finished == finished_at
+    assert generated_at == finished_at

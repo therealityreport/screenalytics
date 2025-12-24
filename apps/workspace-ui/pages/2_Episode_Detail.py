@@ -219,7 +219,19 @@ def _trigger_pdf_export_if_needed(
         return True, f"PDF generated (S3 upload failed: {s3_error})"
     else:
         LOGGER.info("[PDF-EXPORT] Export generated (local storage)")
-        return True, "PDF exported (local storage)"
+    return True, "PDF exported (local storage)"
+
+
+def _presign_s3_key(key: str, *, mime: str = "application/pdf") -> str | None:
+    try:
+        resp = helpers.api_get("/files/presign", params={"key": key, "mime": mime})
+    except Exception as exc:
+        LOGGER.warning("[pdf] Presign failed for %s: %s", key, exc)
+        return None
+    if not isinstance(resp, dict):
+        return None
+    url = resp.get("url")
+    return url if isinstance(url, str) and url.strip() else None
 
 
 def _render_pdf_view_download(
@@ -232,21 +244,25 @@ def _render_pdf_view_download(
     use_container_width: bool = False,
 ) -> stage_layout.RunDebugPdfInfo:
     pdf_info = stage_layout.resolve_run_debug_pdf(ep_id, run_id, stage_entry)
-    if not pdf_info.exists:
+    if not pdf_info.exists and not pdf_info.s3_key:
         return pdf_info
     try:
-        size_bytes = pdf_info.local_path.stat().st_size
+        size_bytes = pdf_info.local_path.stat().st_size if pdf_info.exists else None
     except OSError:
         size_bytes = None
     if show_path:
         size_label = helpers.human_size(size_bytes) if size_bytes is not None else "?"
-        st.caption(f"PDF: {size_label} · `{pdf_info.local_path}`")
-    pdf_url = helpers.ensure_media_url(str(pdf_info.local_path))
+        path_label = f"`{pdf_info.local_path}`" if pdf_info.exists else "remote"
+        st.caption(f"PDF: {size_label} · {path_label}")
+    pdf_url = helpers.ensure_media_url(str(pdf_info.local_path)) if pdf_info.exists else None
+    if not pdf_url and pdf_info.s3_key:
+        pdf_url = _presign_s3_key(pdf_info.s3_key)
     pdf_bytes: bytes | None = None
-    try:
-        pdf_bytes = pdf_info.local_path.read_bytes()
-    except OSError:
-        pdf_bytes = None
+    if pdf_info.exists:
+        try:
+            pdf_bytes = pdf_info.local_path.read_bytes()
+        except OSError:
+            pdf_bytes = None
     download_name = f"screenalytics_{ep_id}_{run_id}_debug_report.pdf"
     view_col, download_col = st.columns(2)
     with view_col:
@@ -273,6 +289,11 @@ def _render_pdf_view_download(
                 mime="application/pdf",
                 key=f"{key_prefix}::download_pdf",
                 use_container_width=use_container_width,
+            )
+        elif pdf_url:
+            st.markdown(
+                f'<a href="{pdf_url}" download="{download_name}" target="_blank" rel="noopener noreferrer">Download PDF</a>',
+                unsafe_allow_html=True,
             )
     return pdf_info
 
@@ -1000,10 +1021,11 @@ def _render_storage_estimate(
     )
 
 
-def _fetch_artifact_status(ep_id: str) -> Dict[str, Any] | None:
+def _fetch_artifact_status(ep_id: str, run_id: str | None = None) -> Dict[str, Any] | None:
     """Fetch artifact sync status from API."""
     try:
-        return helpers.api_get(f"/episodes/{ep_id}/artifact_status")
+        params = {"run_id": run_id} if run_id else None
+        return helpers.api_get(f"/episodes/{ep_id}/artifact_status", params=params)
     except requests.RequestException:
         return None
 
@@ -3092,7 +3114,7 @@ with st.expander(f"Episode {ep_id}", expanded=False):
         st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
     # S3 Sync Status Section
-    artifact_status = _fetch_artifact_status(ep_id)
+    artifact_status = _fetch_artifact_status(ep_id, selected_attempt_run_id)
     if artifact_status:
         sync_status = artifact_status.get("sync_status", "unknown")
         st.markdown("---")
@@ -3100,6 +3122,20 @@ with st.expander(f"Episode {ep_id}", expanded=False):
         local_counts = artifact_status.get("local", {})
         s3_counts = artifact_status.get("s3", {})
         st.caption(_render_artifact_counts(local_counts, s3_counts))
+        missing_run_artifacts = artifact_status.get("missing_run_artifacts")
+        if isinstance(missing_run_artifacts, list) and missing_run_artifacts:
+            missing_labels = []
+            for entry in missing_run_artifacts:
+                if isinstance(entry, dict):
+                    filename = entry.get("filename")
+                    stage_hint = entry.get("stage")
+                    if isinstance(filename, str):
+                        if isinstance(stage_hint, str) and stage_hint:
+                            missing_labels.append(f"{filename} ({stage_hint})")
+                        else:
+                            missing_labels.append(filename)
+            if missing_labels:
+                st.caption(f"Missing remote artifacts: {', '.join(missing_labels)}")
 
         # Show sync button if artifacts need syncing
         if sync_status in ["pending", "partial"]:
@@ -4767,50 +4803,7 @@ with row2_col3:
         st.caption(f"Run Duration: {pdf_export_runtime}")
     elif pdf_export_status_value == "success":
         st.caption("Run Duration: n/a")
-    if selected_attempt_run_id:
-        _render_pdf_view_download(
-            ep_id=ep_id,
-            run_id=selected_attempt_run_id,
-            stage_entry=canonical_stage_entries.get("pdf"),
-            key_prefix=f"{ep_id}::{selected_attempt_run_id}::pdf_export_card",
-            show_path=True,
-            use_container_width=True,
-        )
-
-    pdf_btn_label = "Re-export PDF" if pdf_export_status_value == "success" else "Export PDF"
-    pdf_btn_disabled = (
-        job_running
-        or not selected_attempt_run_id
-        or pdf_export_status_value == "running"
-    )
-    if st.button(
-        pdf_btn_label,
-        key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::run_pdf_export",
-        use_container_width=True,
-        disabled=pdf_btn_disabled,
-    ):
-        with st.spinner("Generating PDF report..."):
-            ok, msg = _trigger_pdf_export_if_needed(
-                ep_id,
-                selected_attempt_run_id,
-                cfg,
-                force=pdf_export_status_value == "success",
-            )
-        if not ok:
-            st.error(msg)
-        else:
-            st.success(msg)
-            st.session_state[_status_force_refresh_key(ep_id)] = True
-            st.rerun()
-
-    _render_downstream_log_expander(
-        "PDF Export",
-        ep_id=ep_id,
-        stage_key="pdf",
-        run_id=selected_attempt_run_id,
-        status_value=pdf_export_status_value,
-        progress_payload=pdf_progress_display,
-    )
+    st.caption("Use the PDF Export section below for View/Download and re-export controls.")
 
 detector_override = st.session_state.pop("episode_detail_detector_override", None)
 tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
@@ -5912,7 +5905,7 @@ def _autorun_drive_downstream(run_id: str) -> None:
             run_id,
             canonical_stage_entries.get("pdf"),
         )
-        if pdf_export_status_value == "success" and pdf_info.exists:
+        if pdf_export_status_value == "success" and (pdf_info.exists or pdf_info.s3_key):
             _autorun_append_completed("PDF Export")
             # Finalize auto-run only when all enabled stages are complete for this run_id.
             st.session_state[_autorun_key] = False
@@ -5932,7 +5925,7 @@ def _autorun_drive_downstream(run_id: str) -> None:
         if pdf_export_status_value == "running":
             return
 
-        force_export = pdf_export_status_value == "success" and not pdf_info.exists
+        force_export = pdf_export_status_value == "success" and not pdf_info.exists and not pdf_info.s3_key
         with st.spinner("Generating PDF report..."):
             ok, msg = _trigger_pdf_export_if_needed(ep_id, run_id, cfg, force=force_export)
         if not ok:
