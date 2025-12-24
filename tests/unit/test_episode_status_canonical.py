@@ -85,6 +85,25 @@ def test_episode_status_derivation_fallback(tmp_path: Path, monkeypatch) -> None
     assert detect_state.derived is True
 
 
+def test_pdf_reconciles_running_when_exports_exist(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-pdf-reconcile"
+    run_id = "attempt-8"
+    run_root = run_layout.run_root(ep_id, run_id)
+    (run_root / "exports").mkdir(parents=True, exist_ok=True)
+    (run_root / "exports" / "run_debug.pdf").write_bytes(b"%PDF-1.4 test")
+    (run_root / "exports" / "export_index.json").write_text("{}", encoding="utf-8")
+
+    write_stage_started(ep_id, run_id, "pdf")
+    status = read_episode_status(ep_id, run_id)
+    pdf_state = status.stages[Stage.PDF]
+    assert pdf_state.status == StageStatus.SUCCESS
+    assert pdf_state.derived is True
+    assert pdf_state.finished_at is not None
+
+
 def test_episode_status_lost_update_protection(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))

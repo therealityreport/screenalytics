@@ -76,7 +76,9 @@ _STAGE_PREREQS: dict[Stage, StagePrereqs] = {
             ArtifactRequirement("identities", "identities.json", upstream_stage=Stage.CLUSTER),
         ),
     ),
-    Stage.PDF: StagePrereqs(),
+    Stage.PDF: StagePrereqs(
+        upstream=(Stage.TRACK_FUSION,),
+    ),
 }
 
 

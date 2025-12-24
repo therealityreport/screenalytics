@@ -1247,13 +1247,22 @@ class JobService:
             finally:
                 try:
                     from apps.api.services.run_export import build_and_upload_debug_pdf, run_segments_export
+                    from py_screenalytics.run_gates import check_prereqs
 
-                    build_and_upload_debug_pdf(
-                        ep_id=ep_id,
-                        run_id=run_id_norm,
-                        upload_to_s3=False,
-                        write_index=True,
-                    )
+                    gate = check_prereqs("pdf", ep_id, run_id_norm)
+                    if gate.ok:
+                        build_and_upload_debug_pdf(
+                            ep_id=ep_id,
+                            run_id=run_id_norm,
+                            upload_to_s3=False,
+                            write_index=True,
+                        )
+                    else:
+                        LOGGER.info(
+                            "[export] Skipping PDF export finalizer for %s/%s (prereqs not met)",
+                            ep_id,
+                            run_id_norm,
+                        )
                     run_segments_export(ep_id=ep_id, run_id=run_id_norm)
                 except Exception as exc:
                     LOGGER.warning("[export] Run export finalizer failed: %s", exc)

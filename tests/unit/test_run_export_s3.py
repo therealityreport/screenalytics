@@ -284,6 +284,7 @@ class TestBuildAndUploadFunctions:
         validation._storage_config_cache = None
 
         from py_screenalytics import run_layout
+        from py_screenalytics.episode_status import write_stage_finished
         from apps.api.services.run_export import build_and_upload_debug_pdf
 
         ep_id = "test-ep-pdf"
@@ -296,6 +297,7 @@ class TestBuildAndUploadFunctions:
         tracks_path = run_root / "tracks.jsonl"
         with tracks_path.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps({"track_id": 1, "first_ts": 0.0, "last_ts": 1.0}) + "\n")
+        write_stage_finished(ep_id, run_id, "track_fusion")
 
         pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
             ep_id=ep_id,
@@ -329,6 +331,7 @@ class TestBuildAndUploadFunctions:
         validation._storage_config_cache = None
 
         from py_screenalytics import run_layout
+        from py_screenalytics.episode_status import write_stage_finished
         from apps.api.services.run_export import build_and_upload_debug_pdf
 
         ep_id = "test-ep-no-upload"
@@ -341,6 +344,7 @@ class TestBuildAndUploadFunctions:
         tracks_path = run_root / "tracks.jsonl"
         with tracks_path.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps({"track_id": 1, "first_ts": 0.0, "last_ts": 1.0}) + "\n")
+        write_stage_finished(ep_id, run_id, "track_fusion")
 
         pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
             ep_id=ep_id,

@@ -6990,13 +6990,15 @@ def sync_thumbnails_to_s3(ep_id: str) -> Dict[str, Any]:
 
 
 @router.get("/episodes/{ep_id}/artifact_status", tags=["episodes"])
-def get_artifact_status(ep_id: str) -> Dict[str, Any]:
+def get_artifact_status(ep_id: str, run_id: str | None = None) -> Dict[str, Any]:
     """Get detailed artifact status for an episode (local and S3 counts).
 
     Returns counts of frames, crops, thumbnails, and manifests both locally and in S3.
     Useful for displaying sync status in the UI.
     """
     from apps.api.services.storage import artifact_prefixes, episode_context_from_id
+    from py_screenalytics import run_layout
+    from py_screenalytics.episode_status import Stage, stage_artifacts
 
     result: Dict[str, Any] = {
         "ep_id": ep_id,
@@ -7089,6 +7091,54 @@ def get_artifact_status(ep_id: str) -> Dict[str, Any]:
         result["sync_status"] = "pending"
     else:
         result["sync_status"] = "unknown"
+
+    if run_id:
+        try:
+            run_id_norm = run_layout.normalize_run_id(run_id)
+        except ValueError:
+            run_id_norm = None
+        if run_id_norm and STORAGE.s3_enabled():
+            run_root = run_layout.run_root(ep_id, run_id_norm)
+            stage_map: Dict[str, str] = {}
+            run_root_resolved = run_root.resolve()
+            for stage in Stage:
+                for entry in stage_artifacts(ep_id, run_id_norm, stage.value):
+                    if not isinstance(entry, dict):
+                        continue
+                    path = entry.get("path")
+                    if not isinstance(path, str):
+                        continue
+                    try:
+                        rel = Path(path).resolve().relative_to(run_root_resolved)
+                    except Exception:
+                        continue
+                    stage_map[str(rel)] = stage.value
+
+            missing_run_artifacts: list[dict[str, Any]] = []
+            for filename in sorted(run_layout.RUN_ARTIFACT_ALLOWLIST):
+                local_path = run_root / filename
+                if local_path.exists():
+                    continue
+                expected_keys = run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, filename)
+                found_remote = False
+                for key in expected_keys:
+                    try:
+                        if STORAGE.object_exists(key):
+                            found_remote = True
+                            break
+                    except Exception:
+                        continue
+                if not found_remote:
+                    missing_run_artifacts.append(
+                        {
+                            "filename": filename,
+                            "stage": stage_map.get(filename),
+                            "expected_keys": expected_keys,
+                        }
+                    )
+            result["missing_run_artifacts"] = missing_run_artifacts
+        elif run_id_norm:
+            result["missing_run_artifacts"] = []
 
     return result
 

@@ -31,6 +31,7 @@ from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
 from py_screenalytics.episode_status import (
     BlockedReason,
+    EpisodeStatus,
     Stage,
     STAGE_PLAN,
     blocked_update_needed,
@@ -105,6 +106,20 @@ def _format_iso(value: str | None) -> str:
     if not value:
         return "—"
     return value
+
+
+def _compute_run_header_times(
+    status: EpisodeStatus,
+    status_payload: dict[str, Any],
+) -> tuple[datetime | None, datetime | None, datetime | None]:
+    started_times = [state.started_at for state in status.stages.values() if state.started_at]
+    finished_times = [state.finished_at for state in status.stages.values() if state.finished_at]
+    run_started = min(started_times) if started_times else None
+    run_finished = max(finished_times) if finished_times else None
+    generated_at = _parse_iso(status_payload.get("generated_at"))
+    if run_finished and generated_at and generated_at < run_finished:
+        generated_at = run_finished
+    return run_started, run_finished, generated_at
 
 
 def _read_status_payload(ep_id: str, run_id: str) -> dict[str, Any]:
@@ -1131,6 +1146,8 @@ def _resolve_lifecycle_status(stage_key: str, stage_entry: dict[str, Any] | None
     stage_entry = stage_entry if isinstance(stage_entry, dict) else {}
     status_val = str(stage_entry.get("status") or "").strip().lower()
     if status_val in {"success", "completed", "done", "error", "failed", "running", "finalizing", "syncing", "skipped"}:
+        if stage_key == "pdf" and status_val in {"running", "finalizing"} and artifact_state.get("export_index"):
+            return "success"
         return status_val
 
     if stage_key == "detect":
@@ -1473,15 +1490,12 @@ def _build_run_debug_pdf_bytes(*, ep_id: str, run_id: str) -> bytes:
     story.append(Paragraph("Run Debug Report", title_style))
     story.append(Spacer(1, 0.12 * inch))
 
-    started_times = [state.started_at for state in status.stages.values() if state.started_at]
-    finished_times = [state.finished_at for state in status.stages.values() if state.finished_at]
-    run_started = min(started_times) if started_times else None
-    run_finished = max(finished_times) if finished_times else None
+    run_started, run_finished, generated_at = _compute_run_header_times(status, status_payload)
 
     header_rows = [
         ("episode_id", ep_id),
         ("run_id", run_id_norm),
-        ("generated_at", _fmt_val(status_payload.get("generated_at"))),
+        ("generated_at", _fmt_dt(generated_at)),
         ("run_started_at", _fmt_dt(run_started)),
         ("run_finished_at", _fmt_dt(run_finished)),
     ]
@@ -1499,6 +1513,47 @@ def _build_run_debug_pdf_bytes(*, ep_id: str, run_id: str) -> bytes:
     if isinstance(storage_payload, dict):
         for key in sorted(storage_payload.keys()):
             env_rows.append((f"storage.{key}", _fmt_val(storage_payload.get(key))))
+    try:
+        from apps.api.services.storage import StorageService
+
+        storage_service = StorageService()
+        if storage_service.s3_enabled():
+            stage_map: dict[str, str] = {}
+            run_root_resolved = run_root.resolve()
+            for stage_key in stage_keys:
+                for entry in stage_artifacts(ep_id, run_id_norm, stage_key):
+                    if not isinstance(entry, dict):
+                        continue
+                    path = entry.get("path")
+                    if not isinstance(path, str):
+                        continue
+                    try:
+                        rel = Path(path).resolve().relative_to(run_root_resolved)
+                    except Exception:
+                        continue
+                    stage_map[str(rel)] = stage_key
+
+            missing_items: list[str] = []
+            for filename in sorted(run_layout.RUN_ARTIFACT_ALLOWLIST):
+                local_path = run_root / filename
+                if local_path.exists():
+                    continue
+                remote_found = False
+                for s3_key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, filename):
+                    try:
+                        if storage_service.object_exists(s3_key):
+                            remote_found = True
+                            break
+                    except Exception:
+                        continue
+                if not remote_found:
+                    stage_hint = stage_map.get(filename)
+                    label = f"{filename} ({stage_hint})" if stage_hint else filename
+                    missing_items.append(label)
+            if missing_items:
+                env_rows.append(("missing_run_artifacts", ", ".join(missing_items)))
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to compute missing run artifacts: %s", exc)
     _add_section("Environment Summary", env_rows)
 
     timeline_rows: list[tuple[str, Any]] = []
@@ -1516,6 +1571,10 @@ def _build_run_debug_pdf_bytes(*, ep_id: str, run_id: str) -> bytes:
         if state and state.blocked_reason:
             details.append(("reason_code", state.blocked_reason.code))
             details.append(("reason_message", state.blocked_reason.message))
+            if isinstance(state.blocked_reason.details, dict):
+                actions = state.blocked_reason.details.get("suggested_actions")
+                if isinstance(actions, list) and actions:
+                    details.append(("suggested_actions", ", ".join([str(item) for item in actions if item])))
         if state and state.derived and state.derived_from:
             details.append(("derived_from", ", ".join(state.derived_from)))
         timeline_rows.append((stage_key, details))
@@ -6057,6 +6116,9 @@ def build_and_upload_debug_pdf(
         raise
 
     upload_result = None
+    export_index_path: Path | None = None
+    pdf_digest: str | None = None
+    export_index_digest: str | None = None
     _emit_pdf_progress(
         done=1,
         phase="finalizing",
@@ -6101,7 +6163,7 @@ def build_and_upload_debug_pdf(
                     uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
                 )
 
-            write_export_index(
+            export_index_path = write_export_index(
                 ep_id=ep_id,
                 run_id=run_id,
                 export_type="pdf",
@@ -6120,15 +6182,24 @@ def build_and_upload_debug_pdf(
         mark_end=True,
     )
 
+    finished_at = datetime.now(timezone.utc).replace(microsecond=0)
     try:
+        pdf_digest = hashlib.sha256(pdf_bytes).hexdigest()
+        if export_index_path and export_index_path.exists():
+            export_index_digest = hashlib.sha256(export_index_path.read_bytes()).hexdigest()
         write_stage_finished(
             ep_id,
             run_id,
             "pdf",
+            finished_at=finished_at,
             artifact_paths={
                 entry["label"]: entry["path"]
                 for entry in stage_artifacts(ep_id, run_id, "pdf")
                 if isinstance(entry, dict) and entry.get("exists")
+            },
+            artifact_digests={
+                **({"exports/run_debug.pdf": pdf_digest} if pdf_digest else {}),
+                **({"exports/export_index.json": export_index_digest} if export_index_digest else {}),
             },
             metrics={
                 "export_bytes": len(pdf_bytes),
@@ -6157,7 +6228,7 @@ def build_and_upload_debug_pdf(
             "pdf",
             "SUCCESS",
             started_at=started_at,
-            finished_at=_now_iso(),
+            finished_at=finished_at,
             duration_s=None,
             counts={"export_bytes": len(pdf_bytes)},
             artifacts={
@@ -6353,7 +6424,17 @@ def run_segments_export(
         blocked_reason = BlockedReason(
             code="missing_artifact",
             message="segments source missing",
-            details={"expected_path": str(_segments_source_path(ep_id, run_id_norm))},
+            details={
+                "expected_path": str(_segments_source_path(ep_id, run_id_norm)),
+                "reasons": [
+                    {
+                        "code": "missing_artifact",
+                        "message": "segments source missing",
+                        "details": {"expected_path": str(_segments_source_path(ep_id, run_id_norm))},
+                    }
+                ],
+                "suggested_actions": ["Run track_fusion to generate screentime_comparison.json."],
+            },
         )
         blocked_info = StageBlockedInfo(
             reasons=[

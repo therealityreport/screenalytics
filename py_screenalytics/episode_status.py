@@ -316,6 +316,43 @@ def _blocked_reason_from_payload(payload: Mapping[str, Any] | None) -> BlockedRe
     )
 
 
+def _blocked_reason_from_manifest(payload: Mapping[str, Any] | None) -> BlockedReason | None:
+    if not isinstance(payload, Mapping):
+        return None
+    blocked = payload.get("blocked")
+    if not isinstance(blocked, Mapping):
+        return None
+    reasons = blocked.get("blocked_reasons")
+    suggested = blocked.get("suggested_actions")
+    if not isinstance(reasons, list) or not reasons:
+        return None
+    primary = reasons[0] if isinstance(reasons[0], Mapping) else None
+    if not isinstance(primary, Mapping):
+        return None
+    code = primary.get("code") or "blocked"
+    message = primary.get("message") or "Stage blocked"
+    details = {
+        "reasons": [dict(reason) for reason in reasons if isinstance(reason, Mapping)],
+        "suggested_actions": (
+            [str(item) for item in suggested if item] if isinstance(suggested, list) else []
+        ),
+    }
+    return BlockedReason(code=str(code), message=str(message), details=details)
+
+
+def _stage_artifact_mtime(paths: Iterable[Path]) -> datetime | None:
+    mtimes: list[datetime] = []
+    for path in paths:
+        try:
+            if path.exists():
+                mtimes.append(
+                    datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).replace(microsecond=0)
+                )
+        except OSError:
+            continue
+    return max(mtimes) if mtimes else None
+
+
 def _blocked_reason_to_payload(reason: BlockedReason | None) -> dict[str, Any] | None:
     if not reason:
         return None
@@ -580,13 +617,13 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
 
     for stage in stage_plan:
         current = status.stages.get(stage)
-        if current is not None and current.status != StageStatus.NOT_STARTED:
-            continue
+        allow_manifest = current is None or current.status in {StageStatus.NOT_STARTED, StageStatus.RUNNING}
+        allow_artifacts = current is None or current.status in {StageStatus.NOT_STARTED, StageStatus.RUNNING}
 
         manifest_payload, manifest_path = _stage_manifest_payload(ep_id, run_id, stage)
         if manifest_payload is not None:
             manifest_status = StageStatus.from_value(manifest_payload.get("status"))
-            if manifest_status != StageStatus.NOT_STARTED:
+            if manifest_status != StageStatus.NOT_STARTED and (allow_manifest or (current and current.status == StageStatus.BLOCKED)):
                 state = _ensure_stage_state(ep_id, run_id, stage, current)
                 state.status = manifest_status
                 state.derived = True
@@ -600,6 +637,8 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
                     duration_s = manifest_payload.get("duration_s")
                     if isinstance(duration_s, (int, float)):
                         state.duration_s = float(duration_s)
+                if state.status == StageStatus.BLOCKED and state.blocked_reason is None:
+                    state.blocked_reason = _blocked_reason_from_manifest(manifest_payload)
                 manifest_artifacts = _manifest_artifact_paths(manifest_payload)
                 for key, value in manifest_artifacts.items():
                     state.artifact_paths.setdefault(key, value)
@@ -614,14 +653,30 @@ def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStat
         }
         if not artifact_paths:
             continue
-        state = _ensure_stage_state(ep_id, run_id, stage, current)
-        state.status = StageStatus.SUCCESS
-        state.derived = True
-        state.derived_from = list(artifact_paths.values())
-        state.derivation_reason = "artifacts_present"
-        for key, value in artifact_paths.items():
-            state.artifact_paths.setdefault(key, value)
-        status.stages[stage] = state
+        if allow_artifacts and stage in {Stage.PDF, Stage.SEGMENTS}:
+            if stage == Stage.PDF:
+                if "exports/run_debug.pdf" not in artifact_paths or "exports/export_index.json" not in artifact_paths:
+                    continue
+            state = _ensure_stage_state(ep_id, run_id, stage, current)
+            state.status = StageStatus.SUCCESS
+            state.derived = True
+            state.derived_from = list(artifact_paths.values())
+            state.derivation_reason = "artifacts_present"
+            if state.finished_at is None:
+                paths = [Path(path) for path in artifact_paths.values()]
+                state.finished_at = _stage_artifact_mtime(paths)
+            for key, value in artifact_paths.items():
+                state.artifact_paths.setdefault(key, value)
+            status.stages[stage] = state
+
+        if current and current.status == StageStatus.BLOCKED and current.blocked_reason is None:
+            state = _ensure_stage_state(ep_id, run_id, stage, current)
+            state.blocked_reason = BlockedReason(
+                code="blocked",
+                message="Stage blocked (reason unavailable)",
+                details=None,
+            )
+            status.stages[stage] = state
 
     return status
 
