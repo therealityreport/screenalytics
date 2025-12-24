@@ -8,10 +8,13 @@ from py_screenalytics import run_layout
 import pytest
 
 from py_screenalytics.episode_status import (
+    BlockedReason,
     Stage,
     StageStatus,
     StageTransitionError,
+    blocked_update_needed,
     read_episode_status,
+    write_stage_blocked,
     write_stage_finished,
     write_stage_started,
 )
@@ -118,3 +121,31 @@ def test_episode_status_monotonic_transition(tmp_path: Path, monkeypatch) -> Non
         write_stage_started(ep_id, run_id, "detect")
 
     assert excinfo.value.code == "status_regression"
+
+
+def test_stage_blocked_idempotent(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-blocked"
+    run_id = "attempt-6"
+    blocked_reason = BlockedReason(code="missing_artifact", message="Missing tracks.jsonl", details=None)
+
+    assert blocked_update_needed(ep_id, run_id, "detect", blocked_reason)
+    write_stage_blocked(ep_id, run_id, "detect", blocked_reason)
+    assert not blocked_update_needed(ep_id, run_id, "detect", blocked_reason)
+
+
+def test_blocked_does_not_downgrade_success(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-blocked-success"
+    run_id = "attempt-7"
+    blocked_reason = BlockedReason(code="missing_artifact", message="Missing faces.jsonl", details=None)
+
+    write_stage_finished(ep_id, run_id, "detect")
+    write_stage_blocked(ep_id, run_id, "detect", blocked_reason)
+
+    status = read_episode_status(ep_id, run_id)
+    assert status.stages[Stage.DETECT].status == StageStatus.SUCCESS

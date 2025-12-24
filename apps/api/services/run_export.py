@@ -33,6 +33,7 @@ from py_screenalytics.episode_status import (
     BlockedReason,
     Stage,
     STAGE_PLAN,
+    blocked_update_needed,
     collect_git_state,
     normalize_stage_key,
     read_episode_status,
@@ -5870,39 +5871,41 @@ def build_and_upload_debug_pdf(
             },
         )
         blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
-        try:
-            write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
-        except Exception as exc:  # pragma: no cover - best effort status update
-            LOGGER.warning("[export] Failed to mark PDF blocked: %s", exc)
-        try:
-            append_log(
-                ep_id,
-                run_id,
-                "pdf",
-                "WARNING",
-                "stage blocked",
-                progress=0.0,
-                meta={
-                    "reason_code": blocked_reason.code,
-                    "reason_message": blocked_reason.message,
-                    "suggested_actions": list(gate.suggested_actions),
-                },
-            )
-        except Exception as exc:  # pragma: no cover - best effort log write
-            LOGGER.debug("[run_logs] Failed to log PDF blocked: %s", exc)
-        try:
-            write_stage_manifest(
-                ep_id,
-                run_id,
-                "pdf",
-                "BLOCKED",
-                started_at=started_at,
-                finished_at=_now_iso(),
-                duration_s=None,
-                blocked=blocked_info,
-            )
-        except Exception as exc:  # pragma: no cover - best effort manifest write
-            LOGGER.warning("[export] Failed to write PDF blocked manifest: %s", exc)
+        should_block = blocked_update_needed(ep_id, run_id, "pdf", blocked_reason)
+        if should_block:
+            try:
+                write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
+            except Exception as exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[export] Failed to mark PDF blocked: %s", exc)
+            try:
+                append_log(
+                    ep_id,
+                    run_id,
+                    "pdf",
+                    "WARNING",
+                    "stage blocked",
+                    progress=0.0,
+                    meta={
+                        "reason_code": blocked_reason.code,
+                        "reason_message": blocked_reason.message,
+                        "suggested_actions": list(gate.suggested_actions),
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log PDF blocked: %s", exc)
+            try:
+                write_stage_manifest(
+                    ep_id,
+                    run_id,
+                    "pdf",
+                    "BLOCKED",
+                    started_at=started_at,
+                    finished_at=_now_iso(),
+                    duration_s=None,
+                    blocked=blocked_info,
+                )
+            except Exception as exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[export] Failed to write PDF blocked manifest: %s", exc)
         raise RuntimeError(blocked_reason.message)
     try:
         try:
@@ -6362,35 +6365,37 @@ def run_segments_export(
             ],
             suggested_actions=["Run track_fusion to generate screentime_comparison.json."],
         )
-        try:
-            write_stage_blocked(ep_id, run_id_norm, "segments", blocked_reason)
-        except Exception as status_exc:  # pragma: no cover - best effort status update
-            LOGGER.warning("[export] Failed to mark segments blocked: %s", status_exc)
-        try:
-            append_log(
-                ep_id,
-                run_id_norm,
-                "segments",
-                "WARNING",
-                "stage blocked",
-                progress=0.0,
-                meta={"reason_code": blocked_reason.code, "reason_message": blocked_reason.message},
-            )
-        except Exception as log_exc:  # pragma: no cover - best effort log write
-            LOGGER.debug("[run_logs] Failed to log segments blocked: %s", log_exc)
-        try:
-            write_stage_manifest(
-                ep_id,
-                run_id_norm,
-                "segments",
-                "BLOCKED",
-                started_at=started_at,
-                finished_at=_now_iso(),
-                duration_s=None,
-                blocked=blocked_info,
-            )
-        except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-            LOGGER.warning("[export] Failed to write segments blocked manifest: %s", manifest_exc)
+        should_block = blocked_update_needed(ep_id, run_id_norm, "segments", blocked_reason)
+        if should_block:
+            try:
+                write_stage_blocked(ep_id, run_id_norm, "segments", blocked_reason)
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[export] Failed to mark segments blocked: %s", status_exc)
+            try:
+                append_log(
+                    ep_id,
+                    run_id_norm,
+                    "segments",
+                    "WARNING",
+                    "stage blocked",
+                    progress=0.0,
+                    meta={"reason_code": blocked_reason.code, "reason_message": blocked_reason.message},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log segments blocked: %s", log_exc)
+            try:
+                write_stage_manifest(
+                    ep_id,
+                    run_id_norm,
+                    "segments",
+                    "BLOCKED",
+                    started_at=started_at,
+                    finished_at=_now_iso(),
+                    duration_s=None,
+                    blocked=blocked_info,
+                )
+            except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[export] Failed to write segments blocked manifest: %s", manifest_exc)
         LOGGER.info("[export] segments.parquet blocked: %s", exc)
         return None
     except Exception as exc:
