@@ -54,6 +54,7 @@ from py_screenalytics.pipeline.constants import (
 from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
     BlockedReason,
+    blocked_update_needed,
     normalize_stage_key,
     stage_artifacts,
     write_stage_blocked,
@@ -726,43 +727,45 @@ def run_stage(
     gate = check_prereqs(stage.value, episode_id, config.run_id)
     if not gate.ok:
         blocked_reason, blocked_info = _blocked_details(gate)
-        try:
-            append_log(
-                episode_id,
-                config.run_id,
-                stage.value,
-                "WARNING",
-                "stage blocked",
-                progress=0.0,
-                meta={
-                    "reason_code": blocked_reason.code,
-                    "reason_message": blocked_reason.message,
-                    "suggested_actions": list(gate.suggested_actions),
-                },
-            )
-        except Exception as log_exc:  # pragma: no cover - best effort log write
-            LOGGER.warning("[run_logs] Failed to log %s blocked: %s", stage.value, log_exc)
-        try:
-            write_stage_blocked(episode_id, config.run_id, stage.value, blocked_reason)
-        except Exception as exc:  # pragma: no cover - best effort status update
-            LOGGER.warning("[episode_status] Failed to mark %s blocked: %s", stage.value, exc)
-        try:
-            write_stage_manifest(
-                episode_id,
-                config.run_id,
-                stage.value,
-                "BLOCKED",
-                started_at=started_at,
-                finished_at=_utcnow_iso(),
-                duration_s=time.time() - start_time,
-                blocked=blocked_info,
-                thresholds=_stage_thresholds(stage, config),
-                counts=None,
-                artifacts=None,
-                model_versions=None,
-            )
-        except Exception as exc:  # pragma: no cover - best effort manifest write
-            LOGGER.warning("[manifest] Failed to write %s blocked manifest: %s", stage.value, exc)
+        should_block = blocked_update_needed(episode_id, config.run_id, stage.value, blocked_reason)
+        if should_block:
+            try:
+                append_log(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "WARNING",
+                    "stage blocked",
+                    progress=0.0,
+                    meta={
+                        "reason_code": blocked_reason.code,
+                        "reason_message": blocked_reason.message,
+                        "suggested_actions": list(gate.suggested_actions),
+                    },
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.warning("[run_logs] Failed to log %s blocked: %s", stage.value, log_exc)
+            try:
+                write_stage_blocked(episode_id, config.run_id, stage.value, blocked_reason)
+            except Exception as exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark %s blocked: %s", stage.value, exc)
+            try:
+                write_stage_manifest(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "BLOCKED",
+                    started_at=started_at,
+                    finished_at=_utcnow_iso(),
+                    duration_s=time.time() - start_time,
+                    blocked=blocked_info,
+                    thresholds=_stage_thresholds(stage, config),
+                    counts=None,
+                    artifacts=None,
+                    model_versions=None,
+                )
+            except Exception as exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[manifest] Failed to write %s blocked manifest: %s", stage.value, exc)
         return StageResult(
             stage=stage.value,
             success=False,

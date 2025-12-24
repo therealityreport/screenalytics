@@ -20,6 +20,7 @@ from apps.api.services.screentime import ScreenTimeAnalyzer, ScreenTimeConfig
 from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
     BlockedReason,
+    blocked_update_needed,
     stage_artifacts,
     write_stage_blocked,
     write_stage_failed,
@@ -176,39 +177,41 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 )
                 blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
-                try:
-                    write_stage_blocked(args.ep_id, run_id, "screentime", blocked_reason)
-                except Exception as status_exc:  # pragma: no cover - best effort status update
-                    LOGGER.warning("[screentime] Failed to mark screentime blocked: %s", status_exc)
-                try:
-                    append_log(
-                        args.ep_id,
-                        run_id,
-                        "screentime",
-                        "WARNING",
-                        "stage blocked",
-                        progress=0.0,
-                        meta={
-                            "reason_code": blocked_reason.code,
-                            "reason_message": blocked_reason.message,
-                            "suggested_actions": list(gate.suggested_actions),
-                        },
-                    )
-                except Exception as log_exc:  # pragma: no cover - best effort log write
-                    LOGGER.debug("[run_logs] Failed to log screentime blocked: %s", log_exc)
-                try:
-                    write_stage_manifest(
-                        args.ep_id,
-                        run_id,
-                        "screentime",
-                        "BLOCKED",
-                        started_at=started_at,
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[screentime] Failed to write screentime blocked manifest: %s", manifest_exc)
+                should_block = blocked_update_needed(args.ep_id, run_id, "screentime", blocked_reason)
+                if should_block:
+                    try:
+                        write_stage_blocked(args.ep_id, run_id, "screentime", blocked_reason)
+                    except Exception as status_exc:  # pragma: no cover - best effort status update
+                        LOGGER.warning("[screentime] Failed to mark screentime blocked: %s", status_exc)
+                    try:
+                        append_log(
+                            args.ep_id,
+                            run_id,
+                            "screentime",
+                            "WARNING",
+                            "stage blocked",
+                            progress=0.0,
+                            meta={
+                                "reason_code": blocked_reason.code,
+                                "reason_message": blocked_reason.message,
+                                "suggested_actions": list(gate.suggested_actions),
+                            },
+                        )
+                    except Exception as log_exc:  # pragma: no cover - best effort log write
+                        LOGGER.debug("[run_logs] Failed to log screentime blocked: %s", log_exc)
+                    try:
+                        write_stage_manifest(
+                            args.ep_id,
+                            run_id,
+                            "screentime",
+                            "BLOCKED",
+                            started_at=started_at,
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[screentime] Failed to write screentime blocked manifest: %s", manifest_exc)
                 emit_progress("blocked", blocked_reason.message, run_id=run_id)
                 return 1
         if run_id:
@@ -402,45 +405,50 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error(f"File not found: {exc}")
         if args.run_id:
             run_id_norm = run_layout.normalize_run_id(args.run_id)
+            blocked_reason = BlockedReason(
+                code="missing_prereq",
+                message=str(exc),
+                details=None,
+            )
+            should_block = blocked_update_needed(args.ep_id, run_id_norm, "screentime", blocked_reason)
             try:
-                write_stage_blocked(
-                    args.ep_id,
-                    run_id_norm,
-                    "screentime",
-                    BlockedReason(
-                        code="missing_prereq",
-                        message=str(exc),
-                        details=None,
-                    ),
-                )
+                if should_block:
+                    write_stage_blocked(
+                        args.ep_id,
+                        run_id_norm,
+                        "screentime",
+                        blocked_reason,
+                    )
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[screentime] Failed to mark screentime blocked: %s", status_exc)
             try:
-                append_log(
-                    args.ep_id,
-                    run_id_norm,
-                    "screentime",
-                    "WARNING",
-                    "stage blocked",
-                    progress=100.0,
-                    meta={"error_message": str(exc)},
-                )
+                if should_block:
+                    append_log(
+                        args.ep_id,
+                        run_id_norm,
+                        "screentime",
+                        "WARNING",
+                        "stage blocked",
+                        progress=100.0,
+                        meta={"error_message": str(exc)},
+                    )
             except Exception as log_exc:  # pragma: no cover - best effort log write
                 LOGGER.debug("[run_logs] Failed to log screentime blocked: %s", log_exc)
             try:
-                write_stage_manifest(
-                    args.ep_id,
-                    run_id_norm,
-                    "screentime",
-                    "BLOCKED",
-                    started_at=started_at,
-                    finished_at=_utcnow_iso(),
-                    duration_s=None,
-                    blocked=StageBlockedInfo(
-                        reasons=[GateReason(code="missing_artifact", message=str(exc), details=None)],
-                        suggested_actions=["Run upstream stages to generate screentime prerequisites."],
-                    ),
-                )
+                if should_block:
+                    write_stage_manifest(
+                        args.ep_id,
+                        run_id_norm,
+                        "screentime",
+                        "BLOCKED",
+                        started_at=started_at,
+                        finished_at=_utcnow_iso(),
+                        duration_s=None,
+                        blocked=StageBlockedInfo(
+                            reasons=[GateReason(code="missing_artifact", message=str(exc), details=None)],
+                            suggested_actions=["Run upstream stages to generate screentime prerequisites."],
+                        ),
+                    )
             except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                 LOGGER.warning("[screentime] Failed to write screentime blocked manifest: %s", manifest_exc)
         return 1

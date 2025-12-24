@@ -50,3 +50,18 @@ def test_gate_stage_disabled(tmp_path, monkeypatch) -> None:
     assert not gate.ok
     assert any(reason.code == "stage_disabled" for reason in gate.reasons)
     assert gate.suggested_actions
+
+
+def test_gate_reconciles_upstream_artifacts(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "rhobh-s01e02"
+    run_id = run_layout.get_or_create_run_id(ep_id, None)
+
+    write_stage_finished(ep_id, run_id, "detect")
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    _touch(run_root / "faces.jsonl")
+    _touch(run_root / "body_tracking" / "body_tracks.jsonl")
+
+    gate = check_prereqs("track_fusion", ep_id, run_id, config={"body_tracking": {"enabled": True}})
+    assert gate.ok

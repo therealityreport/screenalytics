@@ -47,6 +47,7 @@ from py_screenalytics.artifacts import ensure_dirs, get_path
 from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
     BlockedReason,
+    blocked_update_needed,
     collect_git_state,
     normalize_stage_key,
     stage_artifacts,
@@ -7145,48 +7146,50 @@ def _maybe_run_body_tracking(
         gate = check_prereqs("body_tracking", ep_id, stage_run_id, config=config)
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
-            try:
+            should_block = blocked_update_needed(ep_id, stage_run_id, "body_tracking", blocked_reason)
+            if should_block:
                 try:
-                    append_log(
+                    try:
+                        append_log(
+                            ep_id,
+                            stage_run_id,
+                            "body_tracking",
+                            "WARNING",
+                            "stage blocked",
+                            progress=0.0,
+                            meta={
+                                "reason_code": blocked_reason.code,
+                                "reason_message": blocked_reason.message,
+                                "suggested_actions": list(gate.suggested_actions),
+                            },
+                        )
+                    except Exception as log_exc:  # pragma: no cover - best effort log write
+                        LOGGER.debug("[run_logs] Failed to log body_tracking blocked: %s", log_exc)
+                    write_stage_blocked(
                         ep_id,
                         stage_run_id,
                         "body_tracking",
-                        "WARNING",
-                        "stage blocked",
-                        progress=0.0,
-                        meta={
-                            "reason_code": blocked_reason.code,
-                            "reason_message": blocked_reason.message,
-                            "suggested_actions": list(gate.suggested_actions),
-                        },
+                        blocked_reason,
                     )
-                except Exception as log_exc:  # pragma: no cover - best effort log write
-                    LOGGER.debug("[run_logs] Failed to log body_tracking blocked: %s", log_exc)
-                write_stage_blocked(
-                    ep_id,
-                    stage_run_id,
-                    "body_tracking",
-                    blocked_reason,
-                )
-            except Exception as status_exc:  # pragma: no cover - best effort status update
-                LOGGER.warning("[episode_status] Failed to mark body_tracking blocked: %s", status_exc)
-            if emit_manifests:
-                try:
-                    write_stage_manifest(
-                        ep_id,
-                        stage_run_id,
-                        "body_tracking",
-                        "BLOCKED",
-                        started_at=_utcnow_iso(),
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                        thresholds={
-                            "enabled": (config.get("body_tracking") or {}).get("enabled"),
-                        },
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[manifest] Failed to write body_tracking blocked manifest: %s", manifest_exc)
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark body_tracking blocked: %s", status_exc)
+                if emit_manifests:
+                    try:
+                        write_stage_manifest(
+                            ep_id,
+                            stage_run_id,
+                            "body_tracking",
+                            "BLOCKED",
+                            started_at=_utcnow_iso(),
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                            thresholds={
+                                "enabled": (config.get("body_tracking") or {}).get("enabled"),
+                            },
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[manifest] Failed to write body_tracking blocked manifest: %s", manifest_exc)
             return None
     else:
         enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
@@ -7719,48 +7722,50 @@ def _maybe_run_body_tracking_fusion(
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
             LOGGER.debug("[body_tracking_fusion] Gate blocked: %s", blocked_reason.message)
-            try:
+            should_block = blocked_update_needed(ep_id, stage_run_id, "track_fusion", blocked_reason)
+            if should_block:
                 try:
-                    append_log(
+                    try:
+                        append_log(
+                            ep_id,
+                            stage_run_id,
+                            "track_fusion",
+                            "WARNING",
+                            "stage blocked",
+                            progress=0.0,
+                            meta={
+                                "reason_code": blocked_reason.code,
+                                "reason_message": blocked_reason.message,
+                                "suggested_actions": list(gate.suggested_actions),
+                            },
+                        )
+                    except Exception as log_exc:  # pragma: no cover - best effort log write
+                        LOGGER.debug("[run_logs] Failed to log track_fusion blocked: %s", log_exc)
+                    write_stage_blocked(
                         ep_id,
                         stage_run_id,
                         "track_fusion",
-                        "WARNING",
-                        "stage blocked",
-                        progress=0.0,
-                        meta={
-                            "reason_code": blocked_reason.code,
-                            "reason_message": blocked_reason.message,
-                            "suggested_actions": list(gate.suggested_actions),
-                        },
+                        blocked_reason,
                     )
-                except Exception as log_exc:  # pragma: no cover - best effort log write
-                    LOGGER.debug("[run_logs] Failed to log track_fusion blocked: %s", log_exc)
-                write_stage_blocked(
-                    ep_id,
-                    stage_run_id,
-                    "track_fusion",
-                    blocked_reason,
-                )
-            except Exception as status_exc:  # pragma: no cover - best effort status update
-                LOGGER.warning("[episode_status] Failed to mark track_fusion blocked: %s", status_exc)
-            if emit_manifests:
-                try:
-                    write_stage_manifest(
-                        ep_id,
-                        stage_run_id,
-                        "track_fusion",
-                        "BLOCKED",
-                        started_at=_utcnow_iso(),
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                        thresholds={
-                            "enabled": (config.get("body_tracking") or {}).get("enabled"),
-                        },
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[manifest] Failed to write track_fusion blocked manifest: %s", manifest_exc)
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark track_fusion blocked: %s", status_exc)
+                if emit_manifests:
+                    try:
+                        write_stage_manifest(
+                            ep_id,
+                            stage_run_id,
+                            "track_fusion",
+                            "BLOCKED",
+                            started_at=_utcnow_iso(),
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                            thresholds={
+                                "enabled": (config.get("body_tracking") or {}).get("enabled"),
+                            },
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[manifest] Failed to write track_fusion blocked manifest: %s", manifest_exc)
             return None
     else:
         enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
@@ -8188,33 +8193,34 @@ def _run_detect_track_stage(
         gate = check_prereqs("detect", args.ep_id, run_id)
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
-            try:
-                write_stage_blocked(args.ep_id, run_id, "detect", blocked_reason)
-            except Exception as status_exc:  # pragma: no cover - best effort status update
-                LOGGER.warning("[episode_status] Failed to mark detect blocked: %s", status_exc)
-            if emit_manifests:
+            if blocked_update_needed(args.ep_id, run_id, "detect", blocked_reason):
                 try:
-                    write_stage_manifest(
-                        args.ep_id,
-                        run_id,
-                        "detect",
-                        "BLOCKED",
-                        started_at=started_at,
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                        thresholds={
-                            "det_thresh": getattr(args, "det_thresh", None),
-                            "track_high_thresh": getattr(args, "track_high_thresh", None),
-                            "new_track_thresh": getattr(args, "new_track_thresh", None),
-                            "min_box_area": getattr(args, "min_box_area", None),
-                            "stride": getattr(args, "stride", None),
-                            "scene_threshold": getattr(args, "scene_threshold", None),
-                            "scene_min_len": getattr(args, "scene_min_len", None),
-                        },
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[manifest] Failed to write detect blocked manifest: %s", manifest_exc)
+                    write_stage_blocked(args.ep_id, run_id, "detect", blocked_reason)
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark detect blocked: %s", status_exc)
+                if emit_manifests:
+                    try:
+                        write_stage_manifest(
+                            args.ep_id,
+                            run_id,
+                            "detect",
+                            "BLOCKED",
+                            started_at=started_at,
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                            thresholds={
+                                "det_thresh": getattr(args, "det_thresh", None),
+                                "track_high_thresh": getattr(args, "track_high_thresh", None),
+                                "new_track_thresh": getattr(args, "new_track_thresh", None),
+                                "min_box_area": getattr(args, "min_box_area", None),
+                                "stride": getattr(args, "stride", None),
+                                "scene_threshold": getattr(args, "scene_threshold", None),
+                                "scene_min_len": getattr(args, "scene_min_len", None),
+                            },
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[manifest] Failed to write detect blocked manifest: %s", manifest_exc)
             raise RuntimeError(blocked_reason.message)
     if run_id:
         try:
@@ -8794,30 +8800,35 @@ def _run_faces_embed_stage(
         gate = check_prereqs("faces", args.ep_id, run_id)
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
-            try:
-                write_stage_blocked(args.ep_id, run_id, "faces", blocked_reason)
-            except Exception as status_exc:  # pragma: no cover - best effort status update
-                LOGGER.warning("[episode_status] Failed to mark faces blocked: %s", status_exc)
-            if emit_manifests:
+            if blocked_update_needed(args.ep_id, run_id, "faces", blocked_reason):
                 try:
-                    write_stage_manifest(
-                        args.ep_id,
-                        run_id,
-                        "faces",
-                        "BLOCKED",
-                        started_at=_utcnow_iso(),
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                        thresholds={
-                            "max_samples_per_track": getattr(args, "max_samples_per_track", None),
-                            "min_samples_per_track": getattr(args, "min_samples_per_track", None),
-                            "sample_every_n_frames": getattr(args, "sample_every_n_frames", None),
-                        },
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[manifest] Failed to write faces blocked manifest: %s", manifest_exc)
+                    write_stage_blocked(args.ep_id, run_id, "faces", blocked_reason)
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark faces blocked: %s", status_exc)
+                if emit_manifests:
+                    try:
+                        write_stage_manifest(
+                            args.ep_id,
+                            run_id,
+                            "faces",
+                            "BLOCKED",
+                            started_at=_utcnow_iso(),
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                            thresholds={
+                                "max_samples_per_track": getattr(args, "max_samples_per_track", None),
+                                "min_samples_per_track": getattr(args, "min_samples_per_track", None),
+                                "sample_every_n_frames": getattr(args, "sample_every_n_frames", None),
+                            },
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[manifest] Failed to write faces blocked manifest: %s", manifest_exc)
             raise RuntimeError(blocked_reason.message)
+        try:
+            write_stage_started(args.ep_id, run_id, "faces")
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark faces start: %s", exc)
     track_path = _tracks_path_for_run(args.ep_id, run_id)
     try:
         # Validate tracks.jsonl exists and has usable data
@@ -10329,29 +10340,30 @@ def _run_cluster_stage(
         gate = check_prereqs("cluster", args.ep_id, run_id)
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
-            try:
-                write_stage_blocked(args.ep_id, run_id, "cluster", blocked_reason)
-            except Exception as status_exc:  # pragma: no cover - best effort status update
-                LOGGER.warning("[episode_status] Failed to mark cluster blocked: %s", status_exc)
-            if emit_manifests:
+            if blocked_update_needed(args.ep_id, run_id, "cluster", blocked_reason):
                 try:
-                    write_stage_manifest(
-                        args.ep_id,
-                        run_id,
-                        "cluster",
-                        "BLOCKED",
-                        started_at=_utcnow_iso(),
-                        finished_at=_utcnow_iso(),
-                        duration_s=None,
-                        blocked=blocked_info,
-                        thresholds={
-                            "cluster_thresh": getattr(args, "cluster_thresh", None),
-                            "min_identity_sim": getattr(args, "min_identity_sim", None),
-                            "min_cluster_size": getattr(args, "min_cluster_size", None),
-                        },
-                    )
-                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
-                    LOGGER.warning("[manifest] Failed to write cluster blocked manifest: %s", manifest_exc)
+                    write_stage_blocked(args.ep_id, run_id, "cluster", blocked_reason)
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark cluster blocked: %s", status_exc)
+                if emit_manifests:
+                    try:
+                        write_stage_manifest(
+                            args.ep_id,
+                            run_id,
+                            "cluster",
+                            "BLOCKED",
+                            started_at=_utcnow_iso(),
+                            finished_at=_utcnow_iso(),
+                            duration_s=None,
+                            blocked=blocked_info,
+                            thresholds={
+                                "cluster_thresh": getattr(args, "cluster_thresh", None),
+                                "min_identity_sim": getattr(args, "min_identity_sim", None),
+                                "min_cluster_size": getattr(args, "min_cluster_size", None),
+                            },
+                        )
+                    except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                        LOGGER.warning("[manifest] Failed to write cluster blocked manifest: %s", manifest_exc)
             raise RuntimeError(blocked_reason.message)
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"

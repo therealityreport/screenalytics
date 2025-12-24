@@ -82,6 +82,19 @@ def normalize_stage_key(raw: str | None) -> str | None:
     return _STAGE_KEY_ALIASES.get(label)
 
 
+def resolve_stage_key(stage_key: str | None, available: Iterable[str]) -> str | None:
+    if not stage_key:
+        return None
+    normalized = normalize_stage_key(stage_key) or stage_key
+    for candidate in available:
+        if candidate == normalized:
+            return candidate
+    for candidate in available:
+        if normalize_stage_key(candidate) == normalized:
+            return candidate
+    return None
+
+
 def stage_label(stage_key: str | None) -> str:
     if not stage_key:
         return "Unknown"
