@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from py_screenalytics import run_layout
+from py_screenalytics.artifacts import get_path
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -120,6 +123,117 @@ class ArtifactSyncResult:
             "deleted_count": self.deleted_count,
             "deleted_files": self.deleted_files,
         }
+
+
+@dataclass
+class DeleteResult:
+    """Result of a run-scoped delete operation."""
+
+    deleted_local_paths: list[str] = field(default_factory=list)
+    deleted_remote_keys: list[str] = field(default_factory=list)
+    skipped: list[dict[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "deleted_local_paths": self.deleted_local_paths,
+            "deleted_remote_keys": self.deleted_remote_keys,
+            "skipped": self.skipped,
+        }
+
+
+def _guard_child_path(root: Path, child: Path, *, label: str) -> None:
+    root_resolved = root.resolve()
+    child_resolved = child.resolve()
+    if not child_resolved.is_relative_to(root_resolved):
+        raise ValueError(f"Refusing to delete {label}: {child} is outside {root}")
+
+
+def _append_skip(result: DeleteResult, path_or_key: str, reason: str) -> None:
+    result.skipped.append({"path": path_or_key, "reason": reason})
+
+
+def delete_run(
+    ep_id: str,
+    run_id: str,
+    *,
+    delete_local: bool = True,
+    delete_remote: bool = True,
+) -> DeleteResult:
+    """Delete all run-scoped artifacts for a given episode/run_id."""
+    from apps.api.services.storage import delete_local_tree
+    from apps.api.services.storage_backend import get_storage_backend
+
+    result = DeleteResult()
+    run_id_norm = run_layout.normalize_run_id(run_id)
+
+    run_root = run_layout.run_root(ep_id, run_id_norm)
+    runs_root = run_layout.runs_root(ep_id)
+    _guard_child_path(runs_root, run_root, label="run_root")
+    if ep_id not in run_root.parts or run_id_norm not in run_root.parts:
+        raise ValueError(f"Refusing to delete unexpected run_root: {run_root}")
+
+    frames_root = get_path(ep_id, "frames_root")
+    frames_runs_root = frames_root / "runs"
+    frames_run_root = frames_runs_root / run_id_norm
+    if frames_run_root.exists():
+        _guard_child_path(frames_runs_root, frames_run_root, label="frames_run_root")
+
+    if delete_local:
+        if run_root.exists():
+            delete_local_tree(run_root)
+            result.deleted_local_paths.append(str(run_root))
+        else:
+            _append_skip(result, str(run_root), "missing_local_run_root")
+
+        if frames_run_root.exists():
+            delete_local_tree(frames_run_root)
+            result.deleted_local_paths.append(str(frames_run_root))
+        else:
+            _append_skip(result, str(frames_run_root), "missing_local_run_frames")
+
+        # Legacy episode-scoped frames/crops are shared across runs; keep them.
+        legacy_paths = [
+            frames_root / "frames",
+            frames_root / "crops",
+            frames_root / "thumbs",
+        ]
+        for legacy_path in legacy_paths:
+            if legacy_path.exists():
+                _append_skip(result, str(legacy_path), "episode_scoped_shared")
+    else:
+        _append_skip(result, str(run_root), "delete_local_disabled")
+        _append_skip(result, str(frames_run_root), "delete_local_disabled")
+
+    if delete_remote:
+        layout = run_layout.get_run_s3_layout(ep_id, run_id_norm)
+        prefixes = {layout.legacy_prefix}
+        if layout.canonical_prefix:
+            prefixes.add(layout.canonical_prefix)
+
+        storage_backend = get_storage_backend()
+        storage_service = None
+        if storage_backend.backend_type in {"s3", "minio"} and hasattr(storage_backend, "_get_storage"):
+            storage_service = storage_backend._get_storage()  # type: ignore[attr-defined]
+        elif storage_backend.backend_type == "hybrid":
+            s3_backend = getattr(storage_backend, "_s3", None)
+            if s3_backend is not None and hasattr(s3_backend, "_get_storage"):
+                storage_service = s3_backend._get_storage()  # type: ignore[attr-defined]
+
+        if storage_service is None or storage_service.backend not in {"s3", "minio"}:
+            for prefix in prefixes:
+                _append_skip(result, prefix, "remote_storage_unavailable")
+        else:
+            for prefix in prefixes:
+                keys = storage_service.list_objects(prefix, max_items=1_000_000)
+                if not keys:
+                    _append_skip(result, prefix, "missing_remote_prefix")
+                    continue
+                storage_service.delete_prefix(prefix)
+                result.deleted_remote_keys.extend(keys)
+    else:
+        _append_skip(result, run_layout.run_s3_prefix(ep_id, run_id_norm), "delete_remote_disabled")
+
+    return result
 
 
 @dataclass
