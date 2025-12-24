@@ -29,6 +29,8 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 import ui_helpers as helpers  # noqa: E402
 from py_screenalytics import run_layout  # noqa: E402
+import faces_review_artifacts  # noqa: E402
+import faces_review_run_scoped  # noqa: E402
 from similarity_badges import (  # noqa: E402
     SimilarityType,
     render_similarity_badge,
@@ -155,6 +157,7 @@ helpers.render_page_header("workspace-ui:3_Faces_Review", "Faces & Tracks Review
 
 # Current run_id scope for this page (required for run-scoped mutations + artifact reads).
 _CURRENT_RUN_ID: str | None = None
+_LEGACY_PEOPLE_FALLBACK: bool = False
 help_cols = st.columns([3, 1])
 with help_cols[0]:
     st.caption("Need the playbook? Open the full Faces Review guide for flow, job settings, and safety tips.")
@@ -534,6 +537,39 @@ def _render_sync_to_s3_button(ep_id: str) -> None:
                         st.error("Sync timed out - try again or check S3 connectivity")
                     except Exception as e:
                         st.error(f"Sync failed: {e}")
+
+
+def _ensure_faces_review_artifacts(ep_id: str, run_id: str) -> faces_review_artifacts.RunArtifactHydration:
+    return faces_review_artifacts.ensure_run_artifacts_local(
+        ep_id,
+        run_id,
+        faces_review_artifacts.FACES_REVIEW_REQUIRED_ARTIFACTS,
+        optional=faces_review_artifacts.FACES_REVIEW_OPTIONAL_ARTIFACTS,
+    )
+
+
+def _render_missing_run_artifacts(
+    ep_id: str,
+    run_id: str,
+    check: faces_review_artifacts.RunArtifactHydration,
+) -> None:
+    if not check.missing_required:
+        return
+    if not check.storage_enabled:
+        st.warning(
+            "Run artifacts for this attempt are not present locally and hydration_from_s3 is false; "
+            "cannot display clusters or thumbnails."
+        )
+    else:
+        st.warning("Run artifacts are missing locally and could not be hydrated from S3.")
+    st.caption(f"Run: `{ep_id}` / `{run_id}`")
+    st.caption("Missing required files:")
+    for rel_path in check.missing_required:
+        st.caption(f"• `{rel_path}`")
+    if check.missing_optional:
+        st.caption("Missing optional files (metrics/quality may be incomplete):")
+        for rel_path in check.missing_optional:
+            st.caption(f"• `{rel_path}`")
 
 
 def _extract_s3_key_from_url(url: str) -> str:
@@ -2109,13 +2145,19 @@ def _episode_people(ep_id: str) -> tuple[str | None, List[Dict[str, Any]]]:
 
 
 def _episode_cluster_ids(person: Dict[str, Any], ep_id: str) -> List[str]:
-    cluster_ids: List[str] = []
-    for raw in person.get("cluster_ids", []) or []:
-        if not isinstance(raw, str):
-            continue
-        if raw.startswith(f"{ep_id}:"):
-            cluster_ids.append(raw.split(":", 1)[1] if ":" in raw else raw)
-    return cluster_ids
+    run_id = _CURRENT_RUN_ID
+    run_ids, legacy_ids = faces_review_run_scoped.split_cluster_ids(
+        person.get("cluster_ids", []) or [],
+        ep_id,
+        run_id,
+    )
+    if run_id:
+        if run_ids:
+            return run_ids
+        if _LEGACY_PEOPLE_FALLBACK:
+            return legacy_ids
+        return []
+    return legacy_ids
 
 
 def _cluster_counts(cluster_meta: Dict[str, Any] | None) -> tuple[int, int]:
@@ -2147,8 +2189,16 @@ def _episode_person_counts(
 
 def _load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
     """Load cluster centroids (with per-cluster cohesion) from manifests."""
-    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-    path = data_root / "manifests" / ep_id / "cluster_centroids.json"
+    run_id = _CURRENT_RUN_ID
+    if run_id:
+        try:
+            run_id_norm = run_layout.normalize_run_id(run_id)
+            path = run_layout.run_root(ep_id, run_id_norm) / "cluster_centroids.json"
+        except ValueError:
+            path = Path("missing")
+    else:
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        path = data_root / "manifests" / ep_id / "cluster_centroids.json"
     if not path.exists():
         return {}
     try:
@@ -4812,7 +4862,42 @@ def _render_people_view(
 
     # Show message if no people at all
     if not cast_gallery_cards and total_items == 0 and not filter_cast_id:
-        st.info("No people with clusters in this episode yet. Run 'Group Clusters (auto)' to create people.")
+        already_ran = st.session_state.get(f"{ep_id}::{_CURRENT_RUN_ID}::group_clusters_auto_ran", False)
+        should_offer = faces_review_run_scoped.should_offer_group_clusters(
+            people,
+            ep_id,
+            _CURRENT_RUN_ID,
+            already_ran,
+        )
+        has_clusters = bool(identity_index) or bool(cluster_lookup)
+        if should_offer and has_clusters:
+            st.info(
+                "Clusters exist for this attempt, but no grouped people were found. "
+                "Run Group Clusters (auto) to create people for this run."
+            )
+            if st.button(
+                "Run Group Clusters (auto)",
+                key=f"group_clusters_auto:{ep_id}:{_CURRENT_RUN_ID}",
+                use_container_width=True,
+            ):
+                with st.spinner("Grouping clusters..."):
+                    payload = {
+                        "strategy": "auto",
+                        "protect_manual": True,
+                        "facebank_first": True,
+                        "skip_cast_assignment": False,
+                        "execution_mode": "local",
+                    }
+                    resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=180.0)
+                    if resp and resp.get("status") in {"success", "ok"}:
+                        st.session_state[f"{ep_id}::{_CURRENT_RUN_ID}::group_clusters_auto_ran"] = True
+                        _invalidate_assignment_caches()
+                        st.success("Grouped clusters. Refreshing…")
+                        st.rerun()
+                    else:
+                        st.error("Failed to group clusters. Check API logs for details.")
+        else:
+            st.info("No people with clusters in this episode yet. Run 'Group Clusters (auto)' to create people.")
 
 
 def _render_person_clusters(
@@ -6734,6 +6819,20 @@ try:
 except Exception:
     pass
 
+artifact_check = _ensure_faces_review_artifacts(ep_id, resolved_run_id)
+if artifact_check.hydrated:
+    hydrated_key = f"{ep_id}::{resolved_run_id}::faces_review_hydrated"
+    if not st.session_state.get(hydrated_key):
+        st.session_state[hydrated_key] = True
+        st.info(f"Hydrated {len(artifact_check.hydrated)} run artifact(s) from S3 for this attempt.")
+if artifact_check.missing_required:
+    _render_missing_run_artifacts(ep_id, resolved_run_id, artifact_check)
+    st.stop()
+if artifact_check.missing_optional:
+    st.caption(
+        "Some optional run artifacts are missing; cluster quality metrics may be incomplete for this attempt."
+    )
+
 _initialize_state(ep_id)
 
 # Check for active Celery jobs and render status (Phase 2 - non-blocking jobs)
@@ -6769,8 +6868,8 @@ if not show_slug:
     st.stop()
 
 st.info(
-    "Group Clusters now runs automatically at the end of **Run Cluster** on the Episode Detail page. "
-    "If you need to regroup, re-run clustering from Episode Detail with the desired thresholds."
+    "Group Clusters can run automatically at the end of **Run Cluster** on the Episode Detail page. "
+    "If this attempt has clusters but no grouped people, use the Group Clusters (auto) button below."
 )
 
 view_state = st.session_state.get("facebank_view", "people")
@@ -6906,6 +7005,27 @@ identity_index = {ident["identity_id"]: ident for ident in identities}
 roster_names = _fetch_roster_names(show_slug)
 people = people_resp.get("people", []) if people_resp else []
 show_id = show_slug
+run_people, legacy_people = faces_review_run_scoped.filter_people_for_run(
+    people,
+    ep_id,
+    _CURRENT_RUN_ID,
+)
+if _CURRENT_RUN_ID:
+    if run_people:
+        people = run_people
+        _LEGACY_PEOPLE_FALLBACK = False
+    elif legacy_people:
+        people = legacy_people
+        _LEGACY_PEOPLE_FALLBACK = True
+        legacy_warn_key = f"{ep_id}::{_CURRENT_RUN_ID}::faces_review_legacy_people"
+        if not st.session_state.get(legacy_warn_key):
+            st.session_state[legacy_warn_key] = True
+            st.warning(
+                "Showing legacy/global people for this episode (no run-scoped people found). "
+                "These may not match the selected attempt."
+            )
+    else:
+        _LEGACY_PEOPLE_FALLBACK = False
 people_lookup = {str(person.get("person_id") or ""): person for person in people}
 
 selected_person = st.session_state.get("selected_person")
