@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path  # noqa: E402
 
 try:  # noqa: E402 - prefer shared helper when available
@@ -246,6 +247,24 @@ def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[s
 
 def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | None:
     payload = helpers.default_detect_track_payload(ep_id)
+    run_id_key = f"{ep_id}::upload_run_id"
+    run_id = st.session_state.get(run_id_key)
+    if not run_id:
+        try:
+            run_id = run_layout.read_active_run_id(ep_id)
+        except Exception:
+            run_id = None
+    if not run_id:
+        try:
+            run_id = run_layout.get_or_create_run_id(ep_id, None, create_dir=True)
+        except Exception:
+            run_id = None
+    if run_id:
+        st.session_state[run_id_key] = run_id
+        payload["run_id"] = run_id
+    else:
+        st.error("Unable to resolve a run_id for detect/track. Open Episode Detail and select an attempt.")
+        return None
     payload["stride"] = helpers.DEFAULT_STRIDE
     payload["device"] = helpers.DEFAULT_DEVICE
     endpoint = "/jobs/detect_track_async"

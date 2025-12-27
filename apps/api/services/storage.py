@@ -909,6 +909,8 @@ class StorageService:
         sample: int = 1,
         max_keys: int = 500,
         start_after: str | None = None,
+        crops_roots: Iterable[Path] | None = None,
+        crops_prefix: str | None = None,
     ) -> Dict[str, Any]:
         sample = max(1, int(sample or 1))
         max_keys = max(1, min(int(max_keys or 1), 1000))
@@ -924,6 +926,7 @@ class StorageService:
                 max_keys,
                 normalized_cursor,
                 cursor_cycle,
+                crops_prefix=crops_prefix,
             )
         return self._list_local_track_crops(
             ep_ctx.ep_id,
@@ -932,6 +935,7 @@ class StorageService:
             max_keys,
             normalized_cursor,
             cursor_cycle,
+            crops_roots=crops_roots,
         )
 
     def _list_local_track_crops(
@@ -942,13 +946,23 @@ class StorageService:
         max_keys: int,
         cursor_key: str | None,
         cursor_cycle: int,
+        crops_roots: Iterable[Path] | None = None,
     ) -> Dict[str, Any]:
         crops_root = get_path(ep_id, "frames_root") / "crops"
-        candidate_roots: List[Path] = [crops_root]
-        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-        legacy_root = fallback_root / ep_id / "tracks"
-        if legacy_root not in candidate_roots:
-            candidate_roots.append(legacy_root)
+        candidate_roots: List[Path] = []
+        if crops_roots:
+            for root in crops_roots:
+                if not root:
+                    continue
+                root_path = Path(root)
+                if root_path not in candidate_roots:
+                    candidate_roots.append(root_path)
+        if not candidate_roots:
+            candidate_roots.append(crops_root)
+            fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+            legacy_root = fallback_root / ep_id / "tracks"
+            if legacy_root not in candidate_roots:
+                candidate_roots.append(legacy_root)
         base_root: Path | None = None
         entries: List[Dict[str, Any]] = []
         for root in candidate_roots:
@@ -992,9 +1006,10 @@ class StorageService:
         max_keys: int,
         cursor_key: str | None,
         cursor_cycle: int,
+        crops_prefix: str | None = None,
     ) -> Dict[str, Any]:
         prefixes = artifact_prefixes(ep_ctx)
-        crops_prefix = prefixes.get("crops")
+        crops_prefix = crops_prefix or prefixes.get("crops")
         if not crops_prefix:
             return {"items": [], "next_start_after": None}
         base_prefix = crops_prefix.rstrip("/") + "/"

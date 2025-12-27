@@ -669,8 +669,9 @@ def _improve_faces_state_key(ep_id: str, suffix: str) -> str:
 
 
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
-def _fetch_identities_cached(ep_id: str) -> Dict[str, Any] | None:
-    return _safe_api_get(f"/episodes/{ep_id}/identities")
+def _fetch_identities_cached(ep_id: str, run_id: str | None) -> Dict[str, Any] | None:
+    params = {"run_id": run_id} if run_id else None
+    return _safe_api_get(f"/episodes/{ep_id}/identities", params=params)
 
 
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
@@ -5020,7 +5021,7 @@ def _render_person_clusters(
 
     # Pre-fetch identities data for potential person-level similarity scoring
     # (actual computation happens during frame rendering if needed)
-    _fetch_identities_cached(ep_id)
+    _fetch_identities_cached(ep_id, _CURRENT_RUN_ID)
 
     st.caption(f"{len(episode_clusters)} clusters · {total_tracks} tracks · {total_faces} frames")
 

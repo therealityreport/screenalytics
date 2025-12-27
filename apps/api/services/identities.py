@@ -118,6 +118,14 @@ def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | Non
         if url:
             return url
 
+    if rel_path:
+        normalized = rel_path.strip()
+        if normalized:
+            frames_root = get_path(ep_id, "frames_root")
+            local_path = frames_root / normalized
+            if local_path.exists():
+                return str(local_path)
+
     return None
 
 
@@ -141,6 +149,14 @@ def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str 
         url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
+
+    if rel_path:
+        normalized = rel_path.strip()
+        if normalized:
+            frames_root = get_path(ep_id, "frames_root")
+            local_path = frames_root / "thumbs" / normalized
+            if local_path.exists():
+                return str(local_path)
 
     return None
 

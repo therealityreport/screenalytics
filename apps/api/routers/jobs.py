@@ -20,9 +20,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 from apps.api.routers import facebank as facebank_router
+from apps.api.routers.episodes import _enqueue_run_stage_job
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services import jobs as jobs_service
 from apps.api.services.jobs import JobNotFoundError, JobService
@@ -118,6 +120,7 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: str = Field(..., description="Run id scope (required)")
     profile: PROFILE_LITERAL | None = Field(
         None,
         description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Overrides stride/FPS/min_size defaults.",
@@ -202,6 +205,7 @@ class DetectTrackRequest(BaseModel):
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: str = Field(..., description="Run id scope (required)")
     profile: PROFILE_LITERAL | None = Field(
         None,
         description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls quality gating and sampling.",
@@ -230,6 +234,7 @@ class FacesEmbedRequest(BaseModel):
 
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: str = Field(..., description="Run id scope (required)")
     profile: PROFILE_LITERAL | None = Field(
         None,
         description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls clustering thresholds.",
@@ -478,6 +483,13 @@ def _normalize_scene_detector(scene_detector: str | None) -> str:
     if value not in SCENE_DETECTOR_CHOICES:
         raise HTTPException(status_code=400, detail=f"Unsupported scene detector '{scene_detector}'")
     return value
+
+
+def _require_run_id(ep_id: str, run_id: str) -> str:
+    try:
+        return run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _coerce_cpu_threads(value: Any) -> int | None:
@@ -944,11 +956,9 @@ def enqueue_track(req: TrackRequest) -> dict:
     }
 
 
-@router.post("/detect_track")
-async def run_detect_track(req: DetectTrackRequest, request: Request):
+async def _enqueue_detect_track_job(req: DetectTrackRequest, request: Request) -> dict:
     await _reject_legacy_payload(request)
-    artifacts = _artifact_summary(req.ep_id)
-    video_path = _validate_episode_ready(req.ep_id)
+    _validate_episode_ready(req.ep_id)
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     scene_detector_value = _normalize_scene_detector(req.scene_detector)
@@ -961,7 +971,6 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     try:
         JOB_SERVICE.ensure_retinaface_ready(detector_value, resolved_device, req.det_thresh)
     except ValueError as exc:
-        # Model validation failed - provide actionable error message
         raise HTTPException(
             status_code=400,
             detail=f"Model initialization failed: {exc}",
@@ -977,104 +986,54 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
             status_code=500,
             detail=f"Unexpected error initializing detector '{detector_value}' on device '{req.device}': {exc}",
         ) from exc
-    progress_path = _progress_file_path(req.ep_id)
-    try:
-        progress_path.unlink()
-    except FileNotFoundError:
-        # Missing progress files are normal when a prior run never started.
-        pass
-    # Remove downstream artifacts before launching a new detect/track run
-    # This ensures faces/cluster artifacts don't reference obsolete track IDs
-    # NOTE: detections.jsonl and tracks.jsonl are NOT deleted here - they are written
-    # atomically via temp files and will only be replaced on successful completion
-    manifests_dir = get_path(req.ep_id, "detections").parent
-    embeds_dir = manifests_dir.parent / "embeds" / req.ep_id
-    stale_paths = [
-        manifests_dir / "faces.jsonl",
-        manifests_dir / "identities.json",
-        embeds_dir / "faces.npy",
-        embeds_dir / "tracks.npy",
-        embeds_dir / "track_ids.json",
-    ]
-    for stale_path in stale_paths:
-        try:
-            stale_path.unlink()
-            LOGGER.info("Removed stale artifact before detect/track rerun: %s", stale_path)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            LOGGER.warning("Failed to remove stale artifact %s: %s", stale_path, exc)
+
+    run_id_norm = _require_run_id(req.ep_id, req.run_id)
     effective = _resolve_detect_track_inputs(req, resolved_device)
-    command = _build_detect_track_command(
-        req,
-        video_path,
-        progress_path,
-        detector_value,
-        tracker_value,
-        req.det_thresh,
-        scene_detector_value,
-        req.scene_threshold,
-        req.scene_min_len,
-        req.scene_warmup_dets,
-        req.track_high_thresh,
-        req.new_track_thresh,
-        req.track_buffer,
-        req.min_box_area,
-        resolved_device,
-        stride_override=effective["stride"],
-        fps_override=effective["fps"],
-        save_frames=effective["save_frames"],
-        save_crops=effective["save_crops"],
-        profile_name=effective["profile"],
-    )
-    result = _run_job_with_optional_sse(
-        command,
-        request,
-        progress_file=progress_path,
-        cpu_threads=effective["cpu_threads"],
-    )
-    if isinstance(result, StreamingResponse):
-        return result
-
-    detections_count = _count_lines(Path(artifacts["detections"]))
-    tracks_count = _count_lines(Path(artifacts["tracks"]))
-    progress_payload = _load_progress_payload(progress_path) or {}
-    progress_resolved_device = progress_payload.get("resolved_device")
-    resolved_device_out = progress_resolved_device or resolved_device
-
-    return {
-        "job": "detect_track",
-        "ep_id": req.ep_id,
-        "command": command,
-        "device": req.device,
-        "resolved_device": resolved_device_out,
-        "profile": effective["profile"],
-        "stride": effective["stride"],
-        "save_frames": effective["save_frames"],
-        "save_crops": effective["save_crops"],
-        "cpu_threads": effective["cpu_threads"],
+    params = {
+        "profile": effective.get("profile"),
+        "stride": effective.get("stride"),
+        "fps": effective.get("fps"),
+        "device": resolved_device,
         "detector": detector_value,
         "tracker": tracker_value,
+        "det_thresh": req.det_thresh,
+        "max_gap": req.max_gap,
+        "save_frames": effective.get("save_frames"),
+        "save_crops": effective.get("save_crops"),
+        "jpeg_quality": req.jpeg_quality,
         "scene_detector": scene_detector_value,
-        "detections_count": detections_count,
-        "tracks_count": tracks_count,
-        "artifacts": artifacts,
-        "progress_file": str(progress_path),
+        "scene_threshold": req.scene_threshold,
+        "scene_min_len": req.scene_min_len,
+        "scene_warmup_dets": req.scene_warmup_dets,
+        "track_high_thresh": req.track_high_thresh,
+        "new_track_thresh": req.new_track_thresh,
+        "track_buffer": req.track_buffer,
+        "min_box_area": req.min_box_area,
+        "cpu_threads": effective.get("cpu_threads"),
     }
+    params = {key: value for key, value in params.items() if value is not None}
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=run_id_norm,
+        stage="detect_track",
+        params=params,
+        source="legacy_jobs",
+    )
+    response.setdefault("state", response.get("status"))
+    return response
 
 
-@router.post("/faces_embed")
-async def run_faces_embed(req: FacesEmbedRequest, request: Request):
+async def _enqueue_faces_embed_job(req: FacesEmbedRequest, request: Request) -> dict:
     await _reject_legacy_payload(request)
+    run_id_norm = _require_run_id(req.ep_id, req.run_id)
     _validate_episode_ready(req.ep_id)
-    track_path = get_path(req.ep_id, "tracks")
+    track_path = run_layout.run_root(req.ep_id, run_id_norm) / "tracks.jsonl"
     if not track_path.exists():
-        raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
+        raise HTTPException(status_code=400, detail="tracks.jsonl not found for run_id; run detect/track first")
     device_value = req.device or "auto"
     try:
         JOB_SERVICE.ensure_arcface_ready(device_value)
     except ValueError as exc:
-        # Model validation failed - provide actionable error message
         raise HTTPException(
             status_code=400,
             detail=f"Face embedding model initialization failed: {exc}",
@@ -1090,201 +1049,84 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
             status_code=500,
             detail=f"Unexpected error initializing ArcFace on device '{device_value}': {exc}",
         ) from exc
-    progress_path = _progress_file_path(req.ep_id)
-    command = _build_faces_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path, cpu_threads=req.cpu_threads)
-    if isinstance(result, StreamingResponse):
-        return result
 
-    manifests_dir = get_path(req.ep_id, "detections").parent
-    faces_path = manifests_dir / "faces.jsonl"
-    faces_count = _count_lines(faces_path)
-    frames_dir = get_path(req.ep_id, "frames_root") / "frames"
-    progress_payload = _load_progress_payload(progress_path)
-    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
-    return {
-        "job": "faces_embed",
-        "ep_id": req.ep_id,
-        "faces_count": faces_count,
+    params = {
+        "profile": req.profile,
         "device": device_value,
-        "resolved_device": resolved_device,
-        "artifacts": {
-            "faces": str(faces_path),
-            "tracks": str(track_path),
-            "frames": str(frames_dir) if req.save_frames else None,
-            "s3_prefixes": _s3_prefixes(req.ep_id),
-        },
-        "progress_file": str(progress_path),
+        "save_frames": req.save_frames,
+        "save_crops": req.save_crops,
+        "jpeg_quality": req.jpeg_quality,
+        "min_frames_between_crops": req.min_frames_between_crops,
+        "thumb_size": req.thumb_size,
+        "cpu_threads": req.cpu_threads,
     }
+    params = {key: value for key, value in params.items() if value is not None}
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=run_id_norm,
+        stage="faces_embed",
+        params=params,
+        source="legacy_jobs",
+    )
+    response.setdefault("state", response.get("status"))
+    return response
+
+
+async def _enqueue_cluster_job(req: ClusterRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
+    run_id_norm = _require_run_id(req.ep_id, req.run_id)
+    faces_path = run_layout.run_root(req.ep_id, run_id_norm) / "faces.jsonl"
+    if not faces_path.exists():
+        raise HTTPException(status_code=400, detail="faces.jsonl not found for run_id; run faces_embed first")
+
+    params = {
+        "device": req.device or "auto",
+        "cluster_thresh": req.cluster_thresh,
+        "min_cluster_size": req.min_cluster_size,
+        "min_identity_sim": req.min_identity_sim,
+        "clear_assignments": req.clear_assignments,
+        "profile": req.profile,
+    }
+    params = {key: value for key, value in params.items() if value is not None}
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=run_id_norm,
+        stage="cluster",
+        params=params,
+        source="legacy_jobs",
+    )
+    response.setdefault("state", response.get("status"))
+    return response
+
+
+@router.post("/detect_track")
+async def run_detect_track(req: DetectTrackRequest, request: Request):
+    return await _enqueue_detect_track_job(req, request)
+
+
+@router.post("/faces_embed")
+async def run_faces_embed(req: FacesEmbedRequest, request: Request):
+    return await _enqueue_faces_embed_job(req, request)
 
 
 @router.post("/cluster")
 async def run_cluster(req: ClusterRequest, request: Request):
-    await _reject_legacy_payload(request)
-    manifests_dir = get_path(req.ep_id, "detections").parent
-    faces_path = manifests_dir / "faces.jsonl"
-    if not faces_path.exists():
-        raise HTTPException(status_code=400, detail="faces.jsonl not found; run faces_embed first")
-
-    # Clear all existing cluster-to-person assignments before clustering
-    # This ensures old cluster IDs and person links are removed so Faces Review starts fresh
-    cleared_count = 0
-    if req.clear_assignments:
-        try:
-            from apps.api.services.grouping import GroupingService
-
-            grouping_service = GroupingService()
-            cleared_count = grouping_service._clear_person_assignments(req.ep_id)
-            if cleared_count > 0:
-                LOGGER.info(
-                    "[%s] Cleared %d existing assignment(s) before clustering",
-                    req.ep_id,
-                    cleared_count,
-                )
-        except Exception as exc:
-            LOGGER.warning(
-                "[%s] Failed to clear assignments before clustering: %s",
-                req.ep_id,
-                exc,
-            )
-
-    progress_path = _progress_file_path(req.ep_id)
-    command = _build_cluster_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
-    if isinstance(result, StreamingResponse):
-        return result
-
-    identities_path = manifests_dir / "identities.json"
-    identities_count = 0
-    faces_count = _count_lines(faces_path)
-    if identities_path.exists():
-        try:
-            identities_doc = json.loads(identities_path.read_text(encoding="utf-8"))
-            identities_count = len(identities_doc.get("identities", []))
-            faces_count = int(identities_doc.get("stats", {}).get("faces", faces_count))
-        except json.JSONDecodeError:
-            # A partially written identities.json should not break the API response.
-            pass
-    progress_payload = _load_progress_payload(progress_path)
-    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
-    return {
-        "job": "cluster",
-        "ep_id": req.ep_id,
-        "identities_count": identities_count,
-        "faces_count": faces_count,
-        "device": req.device or "auto",
-        "resolved_device": resolved_device,
-        "artifacts": {
-            "identities": str(identities_path),
-            "faces": str(faces_path),
-            "s3_prefixes": _s3_prefixes(req.ep_id),
-        },
-        "progress_file": str(progress_path),
-    }
+    return await _enqueue_cluster_job(req, request)
 
 
 @router.post("/detect_track_async")
 async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) -> dict:
-    await _reject_legacy_payload(request)
-    artifacts = _artifact_summary(req.ep_id)
-    video_path = _validate_episode_ready(req.ep_id)
-    detector_value = _normalize_detector(req.detector)
-    tracker_value = _normalize_tracker(req.tracker)
-    scene_detector_value = _normalize_scene_detector(req.scene_detector)
-    resolved_device = req.device
-    try:
-        if getattr(jobs_service, "episode_run", None) and hasattr(jobs_service.episode_run, "resolve_device"):
-            resolved_device = jobs_service.episode_run.resolve_device(req.device, LOGGER)  # type: ignore[attr-defined]
-    except Exception:
-        resolved_device = req.device
-    effective = _resolve_detect_track_inputs(req, resolved_device)
-    try:
-        job = JOB_SERVICE.start_detect_track_job(
-            ep_id=req.ep_id,
-            stride=effective["stride"],
-            fps=effective["fps"],
-            device=req.device,
-            video_path=video_path,
-            profile=effective["profile"],
-            cpu_threads=effective["cpu_threads"],
-            save_frames=effective["save_frames"],
-            save_crops=effective["save_crops"],
-            jpeg_quality=req.jpeg_quality,
-            detector=detector_value,
-            tracker=tracker_value,
-            max_gap=req.max_gap,
-            det_thresh=req.det_thresh,
-            scene_detector=scene_detector_value,
-            scene_threshold=req.scene_threshold,
-            scene_min_len=req.scene_min_len,
-            scene_warmup_dets=req.scene_warmup_dets,
-            track_high_thresh=req.track_high_thresh,
-            new_track_thresh=req.new_track_thresh,
-            track_buffer=req.track_buffer,
-            min_box_area=req.min_box_area,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "job_id": job["job_id"],
-        "ep_id": req.ep_id,
-        "state": job["state"],
-        "started_at": job["started_at"],
-        "progress_file": job["progress_file"],
-        "requested": job.get("requested"),
-        "artifacts": artifacts,
-    }
+    return await _enqueue_detect_track_job(req, request)
 
 
 @router.post("/faces_embed_async")
 async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) -> dict:
-    await _reject_legacy_payload(request)
-    # Ensure the local mirror exists so asynchronous jobs don't fail later
-    _validate_episode_ready(req.ep_id)
-    try:
-        job = JOB_SERVICE.start_faces_embed_job(
-            ep_id=req.ep_id,
-            device=req.device or "auto",
-            profile=req.profile,
-            cpu_threads=req.cpu_threads,
-            save_frames=req.save_frames,
-            save_crops=req.save_crops,
-            jpeg_quality=req.jpeg_quality,
-            thumb_size=req.thumb_size,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "job_id": job["job_id"],
-        "ep_id": req.ep_id,
-        "state": job["state"],
-        "started_at": job["started_at"],
-        "progress_file": job.get("progress_file"),
-        "requested": job.get("requested"),
-    }
+    return await _enqueue_faces_embed_job(req, request)
 
 
 @router.post("/cluster_async")
 async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
-    await _reject_legacy_payload(request)
-    try:
-        job = JOB_SERVICE.start_cluster_job(
-            ep_id=req.ep_id,
-            device=req.device or "auto",
-            cluster_thresh=req.cluster_thresh,
-            min_cluster_size=req.min_cluster_size,
-            min_identity_sim=req.min_identity_sim,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "job_id": job["job_id"],
-        "ep_id": req.ep_id,
-        "state": job["state"],
-        "started_at": job["started_at"],
-        "progress_file": job.get("progress_file"),
-        "requested": job.get("requested"),
-    }
+    return await _enqueue_cluster_job(req, request)
 
 
 @router.post("/episode_cleanup_async")
@@ -1339,13 +1181,7 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
 
 class AnalyzeScreenTimeRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    run_id: str | None = Field(
-        None,
-        description=(
-            "Optional pipeline run identifier. When omitted, defaults to the most recent successful run "
-            "(when available)."
-        ),
-    )
+    run_id: str = Field(..., description="Run id scope (required)")
     quality_min: float | None = Field(None, ge=0.0, le=1.0, description="Minimum face quality threshold")
     gap_tolerance_s: float | None = Field(None, ge=0.0, description="Gap tolerance in seconds")
     use_video_decode: bool | None = Field(None, description="Use video decode for precise timestamps")
@@ -1369,29 +1205,26 @@ class AnalyzeScreenTimeRequest(BaseModel):
 async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -> dict:
     """Analyze per-cast screen time from assigned faces and tracks."""
     await _reject_legacy_payload(request)
-    try:
-        job = JOB_SERVICE.start_screen_time_job(
-            ep_id=req.ep_id,
-            run_id=req.run_id,
-            quality_min=req.quality_min,
-            gap_tolerance_s=req.gap_tolerance_s,
-            use_video_decode=req.use_video_decode,
-            screen_time_mode=req.screen_time_mode,
-            edge_padding_s=req.edge_padding_s,
-            track_coverage_min=req.track_coverage_min,
-            preset=req.preset,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "job_id": job["job_id"],
-        "ep_id": req.ep_id,
-        "state": job["state"],
-        "started_at": job["started_at"],
-        "progress_file": job.get("progress_file"),
-        "requested": job.get("requested"),
+    run_id_norm = _require_run_id(req.ep_id, req.run_id)
+    params = {
+        "quality_min": req.quality_min,
+        "gap_tolerance_s": req.gap_tolerance_s,
+        "use_video_decode": req.use_video_decode,
+        "screen_time_mode": req.screen_time_mode,
+        "edge_padding_s": req.edge_padding_s,
+        "track_coverage_min": req.track_coverage_min,
+        "preset": req.preset,
     }
+    params = {key: value for key, value in params.items() if value is not None}
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=run_id_norm,
+        stage="screentime",
+        params=params,
+        source="legacy_jobs",
+    )
+    response.setdefault("state", response.get("status"))
+    return response
 
 
 class BodyTrackingRequest(BaseModel):

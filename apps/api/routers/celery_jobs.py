@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Literal, Any, Dict, List, Generator
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from celery.result import AsyncResult
 from pydantic import BaseModel, Field
@@ -66,6 +66,7 @@ from apps.api.tasks import (
     run_faces_embed_task,
     run_cluster_task,
 )
+from apps.api.routers.episodes import _enqueue_run_stage_job
 from apps.api.services.log_formatter import LogFormatter, format_config_block, format_completion_summary
 from celery.result import AsyncResult
 
@@ -837,7 +838,7 @@ SCENE_DETECTOR_LITERAL = Literal["pyscenedetect", "internal", "off"]
 class DetectTrackCeleryRequest(BaseModel):
     """Request model for Celery-based detect/track job."""
     ep_id: str = Field(..., description="Episode identifier")
-    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
+    run_id: str = Field(..., description="Run id scope (required)")
     stride: int = Field(6, description="Frame stride for detection sampling")
     fps: Optional[float] = Field(None, description="Optional target FPS for sampling")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
@@ -872,7 +873,7 @@ class DetectTrackCeleryRequest(BaseModel):
 class FacesEmbedCeleryRequest(BaseModel):
     """Request model for Celery-based faces embed (harvest) job."""
     ep_id: str = Field(..., description="Episode identifier")
-    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
+    run_id: str = Field(..., description="Run id scope (required)")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Save sampled frames")
     save_crops: bool = Field(False, description="Save face crops (enable explicitly to avoid storage bloat)")
@@ -894,7 +895,7 @@ class FacesEmbedCeleryRequest(BaseModel):
 class ClusterCeleryRequest(BaseModel):
     """Request model for Celery-based cluster job."""
     ep_id: str = Field(..., description="Episode identifier")
-    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
+    run_id: str = Field(..., description="Run id scope (required)")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
     cluster_thresh: float = Field(0.7, ge=0.2, le=0.99, description="Clustering threshold")
     min_cluster_size: int = Field(2, ge=1, description="Minimum cluster size")
@@ -2933,394 +2934,99 @@ def _stream_local_subprocess(
 # =============================================================================
 
 
+def _wants_ndjson(request: Request) -> bool:
+    accept = (request.headers.get("accept") or "").lower()
+    return "application/x-ndjson" in accept or "text/event-stream" in accept
+
+
 @router.post("/detect_track")
-async def start_detect_track_celery(req: DetectTrackCeleryRequest):
-    """Start a detect/track job.
-
-    Execution Mode:
-        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
-        - execution_mode="local": Runs job synchronously in-process, returns result when done
-
-    Profiles:
-        - Uses selected profile from Pipeline Settings (default: balanced)
-        - Thread caps: low_power=2, balanced=4, performance=8
-
-    Check for active jobs before starting to prevent duplicate runs.
-    """
+async def start_detect_track_celery(req: DetectTrackCeleryRequest, request: Request):
     execution_mode = req.execution_mode or "redis"
-
-    # Check for existing active job (only for redis mode, local mode handles its own locking)
-    if execution_mode == "redis":
-        active_job = check_active_job(req.ep_id, "detect_track")
-        if active_job:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "job_id": active_job,
-                    "ep_id": req.ep_id,
-                    "state": "already_running",
-                    "message": f"Detect/track job {active_job} is already running for this episode",
-                },
-            )
-
-    # Resolve profile based on device (with safety guardrails)
-    resolved_profile, profile_warning = _resolve_profile(req.device, req.profile)
-    LOGGER.info(f"[{req.ep_id}] Profile: {req.profile} -> {resolved_profile} (device={req.device})")
-
-    # Bug #10 fix: Validate device before queuing to catch issues early
-    device_warning = None
-    try:
-        from apps.api.services.validation import normalize_device, DeviceUnavailableError
-
-        device_result = normalize_device(req.device, allow_fallback=True)
-        if device_result.was_fallback:
-            device_warning = device_result.warning or f"Device '{req.device}' unavailable, using {device_result.resolved}"
-            LOGGER.warning(f"[{req.ep_id}] Device fallback: {device_warning}")
-    except DeviceUnavailableError as exc:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ep_id": req.ep_id,
-                "state": "error",
-                "error": "device_unavailable",
-                "message": str(exc),
-            },
-        )
-    except ImportError:
-        LOGGER.debug("[detect_track] Device validation module not available, skipping pre-check")
-
-    # Build options dict (profile not passed - episode_run.py doesn't accept it)
-    options = {
-        "stride": req.stride,
-        "fps": req.fps,
-        "device": req.device,
-        "detector": req.detector,
-        "tracker": req.tracker,
-        "run_id": req.run_id,
-        "save_frames": req.save_frames,
-        "save_crops": req.save_crops,
-        "jpeg_quality": req.jpeg_quality,
-        "det_thresh": req.det_thresh,
-        "max_gap": req.max_gap,
-        "scene_detector": req.scene_detector,
-        "scene_threshold": req.scene_threshold,
-        "scene_min_len": req.scene_min_len,
-        "scene_warmup_dets": req.scene_warmup_dets,
-        "track_high_thresh": req.track_high_thresh,
-        "new_track_thresh": req.new_track_thresh,
-        "track_buffer": req.track_buffer,
-        "min_box_area": req.min_box_area,
-        "cpu_threads": req.cpu_threads,
-        "allow_cpu_fallback": req.allow_cpu_fallback,
-    }
-
-    # Apply profile-based defaults (CPU thread limits, fps, etc.)
-    options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
-
-    try:
-        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
-
-    # Collect all warnings
-    all_warnings = []
-    if profile_warning:
-        all_warnings.append(profile_warning)
-    if device_warning:
-        all_warnings.append(device_warning)
-    all_warnings.extend(config_warnings)
-
-    LOGGER.info(
-        f"[{req.ep_id}] detect_track options: stride={options.get('stride')}, "
-        f"cpu_threads={options.get('cpu_threads')}, device={req.device}, profile={resolved_profile}, "
-        f"execution_mode={execution_mode}"
-    )
-
-    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
-        # Add profile to options for logging
-        options["profile"] = resolved_profile
-        # Include warnings so they're visible in the stream
-        options["_warnings"] = all_warnings
-
-        project_root = _find_project_root()
-        command = _build_detect_track_command(req.ep_id, options, project_root)
-
-        # Return streaming response for live log updates
-        return StreamingResponse(
-            _stream_local_subprocess(command, req.ep_id, "detect_track", options),
-            media_type="application/x-ndjson",
-            headers={
-                "X-Content-Type-Options": "nosniff",
+        options = req.model_dump(exclude={"execution_mode"}, exclude_none=True)
+        command = _build_detect_track_command(req.ep_id, options, _find_project_root())
+        if _wants_ndjson(request):
+            headers = {
                 "Cache-Control": "no-cache",
-            },
-        )
-
-    # Redis/Celery mode (default) - enqueues job and returns immediately
-    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
-    options["profile"] = resolved_profile
-    result = run_detect_track_task.delay(req.ep_id, options)
-
-    response = {
-        "job_id": result.id,
-        "ep_id": req.ep_id,
-        "state": "queued",
-        "operation": "detect_track",
-        "run_id": options.get("run_id"),
-        "execution_mode": "redis",
-        "profile": resolved_profile,
-        "cpu_threads": options.get("cpu_threads"),
-        "message": "Detect/track job queued via Celery",
-    }
-
-    if all_warnings:
-        response["warnings"] = all_warnings
-
+                "X-Content-Type-Options": "nosniff",
+            }
+            return StreamingResponse(
+                _stream_local_subprocess(command, req.ep_id, "detect_track", options),
+                media_type="application/x-ndjson",
+                headers=headers,
+            )
+        return _run_local_subprocess_blocking(command, req.ep_id, "detect_track", options)
+    params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=req.run_id,
+        stage="detect_track",
+        params=params,
+        source="legacy_celery",
+    )
+    response.setdefault("state", response.get("status"))
+    response.setdefault("execution_mode", "redis")
     return response
 
 
 @router.post("/faces_embed")
-async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
-    """Start a faces embed (harvest) job.
-
-    Execution Mode:
-        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
-        - execution_mode="local": Runs job synchronously in-process, returns result when done
-
-    Thermal Safety:
-        - Applies CPU thread limits for laptop-friendly operation
-    """
+async def start_faces_embed_celery(req: FacesEmbedCeleryRequest, request: Request):
     execution_mode = req.execution_mode or "redis"
-
-    # Check for existing active job (only for redis mode)
-    if execution_mode == "redis":
-        active_job = check_active_job(req.ep_id, "faces_embed")
-        if active_job:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "job_id": active_job,
-                    "ep_id": req.ep_id,
-                    "state": "already_running",
-                    "message": f"Faces embed job {active_job} is already running for this episode",
-                },
-            )
-
-    # Resolve profile based on device
-    resolved_profile, profile_warning = _resolve_profile(req.device, req.profile)
-    LOGGER.info(f"[{req.ep_id}] faces_embed Profile: {req.profile} -> {resolved_profile} (device={req.device})")
-
-    # Build options dict (profile not passed - episode_run.py doesn't accept it)
-    options = {
-        "device": req.device,
-        "run_id": req.run_id,
-        "save_frames": req.save_frames,
-        "save_crops": req.save_crops,
-        "jpeg_quality": req.jpeg_quality,
-        "min_frames_between_crops": req.min_frames_between_crops,
-        "thumb_size": req.thumb_size,
-        "cpu_threads": req.cpu_threads,
-        "allow_cpu_fallback": req.allow_cpu_fallback,
-    }
-
-    # Apply profile-based CPU thread defaults
-    options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
-
-    try:
-        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
-
-    LOGGER.info(
-        f"[{req.ep_id}] faces_embed options: cpu_threads={options.get('cpu_threads')}, "
-        f"device={req.device}, profile={resolved_profile}, execution_mode={execution_mode}"
-    )
-
-    # Collect all warnings
-    all_warnings = []
-    if profile_warning:
-        all_warnings.append(profile_warning)
-    all_warnings.extend(config_warnings)
-
-    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
-        # Add profile to options for logging
-        options["profile"] = resolved_profile
-        # Include warnings so they're visible in the stream
-        options["_warnings"] = all_warnings
-
-        project_root = _find_project_root()
-        command = _build_faces_embed_command(req.ep_id, options, project_root)
-
-        # Return streaming response for live log updates
-        return StreamingResponse(
-            _stream_local_subprocess(command, req.ep_id, "faces_embed", options),
-            media_type="application/x-ndjson",
-            headers={
-                "X-Content-Type-Options": "nosniff",
+        options = req.model_dump(exclude={"execution_mode"}, exclude_none=True)
+        command = _build_faces_embed_command(req.ep_id, options, _find_project_root())
+        if _wants_ndjson(request):
+            headers = {
                 "Cache-Control": "no-cache",
-            },
-        )
-
-    # Redis/Celery mode (default) - enqueues job and returns immediately
-    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
-    options["profile"] = resolved_profile
-    result = run_faces_embed_task.delay(req.ep_id, options)
-
-    response = {
-        "job_id": result.id,
-        "ep_id": req.ep_id,
-        "state": "queued",
-        "operation": "faces_embed",
-        "run_id": options.get("run_id"),
-        "execution_mode": "redis",
-        "profile": resolved_profile,
-        "cpu_threads": options.get("cpu_threads"),
-        "message": "Faces embed job queued via Celery",
-    }
-
-    if all_warnings:
-        response["warnings"] = all_warnings
-
+                "X-Content-Type-Options": "nosniff",
+            }
+            return StreamingResponse(
+                _stream_local_subprocess(command, req.ep_id, "faces_embed", options),
+                media_type="application/x-ndjson",
+                headers=headers,
+            )
+        return _run_local_subprocess_blocking(command, req.ep_id, "faces_embed", options)
+    params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=req.run_id,
+        stage="faces_embed",
+        params=params,
+        source="legacy_celery",
+    )
+    response.setdefault("state", response.get("status"))
+    response.setdefault("execution_mode", "redis")
     return response
 
 
 @router.post("/cluster")
-async def start_cluster_celery(req: ClusterCeleryRequest):
-    """Start a clustering job.
-
-    Execution Mode:
-        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
-        - execution_mode="local": Runs job synchronously in-process, returns result when done
-
-    Thermal Safety:
-        - Applies CPU thread limits for laptop-friendly operation
-    """
+async def start_cluster_celery(req: ClusterCeleryRequest, request: Request):
     execution_mode = req.execution_mode or "redis"
-
-    # Check for existing active job (only for redis mode)
-    if execution_mode == "redis":
-        active_job = check_active_job(req.ep_id, "cluster")
-        if active_job:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "job_id": active_job,
-                    "ep_id": req.ep_id,
-                    "state": "already_running",
-                    "message": f"Cluster job {active_job} is already running for this episode",
-                },
-            )
-
-    # Clear all existing cluster-to-person assignments before clustering
-    # This ensures old cluster IDs and person links are removed so Faces Review starts fresh
-    cleared_count = 0
-    if req.clear_assignments:
-        try:
-            from apps.api.services.grouping import GroupingService
-
-            grouping_service = GroupingService()
-            cleared_count = grouping_service._clear_person_assignments(req.ep_id)
-            if cleared_count > 0:
-                LOGGER.info(
-                    "[%s] Cleared %d existing assignment(s) before clustering",
-                    req.ep_id,
-                    cleared_count,
-                )
-        except Exception as exc:
-            LOGGER.warning(
-                "[%s] Failed to clear assignments before clustering: %s",
-                req.ep_id,
-                exc,
-            )
-
-    # Resolve profile based on device
-    resolved_profile, profile_warning = _resolve_profile(req.device, req.profile)
-    LOGGER.info(f"[{req.ep_id}] cluster Profile: {req.profile} -> {resolved_profile} (device={req.device})")
-
-    # Build options dict (profile not passed - episode_run.py doesn't accept it)
-    options = {
-        "device": req.device,
-        "run_id": req.run_id,
-        "cluster_thresh": req.cluster_thresh,
-        "min_cluster_size": req.min_cluster_size,
-        "min_identity_sim": req.min_identity_sim,
-        "cpu_threads": req.cpu_threads,
-        "allow_cpu_fallback": req.allow_cpu_fallback,
-    }
-
-    # Apply profile-based CPU thread defaults
-    options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
-
-    try:
-        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
-
-    LOGGER.info(
-        f"[{req.ep_id}] cluster options: cpu_threads={options.get('cpu_threads')}, "
-        f"device={req.device}, profile={resolved_profile}, execution_mode={execution_mode}"
-    )
-
-    # Collect all warnings
-    all_warnings = []
-    if profile_warning:
-        all_warnings.append(profile_warning)
-    all_warnings.extend(config_warnings)
-
-    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
-        # Add profile to options for logging
-        options["profile"] = resolved_profile
-        # Include warnings so they're visible in the stream
-        options["_warnings"] = all_warnings
-
-        project_root = _find_project_root()
-        command = _build_cluster_command(req.ep_id, options, project_root)
-
-        # Return streaming response for live log updates
-        return StreamingResponse(
-            _stream_local_subprocess(command, req.ep_id, "cluster", options),
-            media_type="application/x-ndjson",
-            headers={
-                "X-Content-Type-Options": "nosniff",
+        options = req.model_dump(exclude={"execution_mode"}, exclude_none=True)
+        command = _build_cluster_command(req.ep_id, options, _find_project_root())
+        if _wants_ndjson(request):
+            headers = {
                 "Cache-Control": "no-cache",
-            },
-        )
-
-    # Redis/Celery mode (default) - enqueues job and returns immediately
-    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
-    options["profile"] = resolved_profile
-    result = run_cluster_task.delay(req.ep_id, options)
-
-    response = {
-        "job_id": result.id,
-        "ep_id": req.ep_id,
-        "state": "queued",
-        "operation": "cluster",
-        "run_id": options.get("run_id"),
-        "execution_mode": "redis",
-        "profile": resolved_profile,
-        "cpu_threads": options.get("cpu_threads"),
-        "message": "Cluster job queued via Celery",
-    }
-
-    if all_warnings:
-        response["warnings"] = all_warnings
-
+                "X-Content-Type-Options": "nosniff",
+            }
+            return StreamingResponse(
+                _stream_local_subprocess(command, req.ep_id, "cluster", options),
+                media_type="application/x-ndjson",
+                headers=headers,
+            )
+        return _run_local_subprocess_blocking(command, req.ep_id, "cluster", options)
+    params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
+    response = _enqueue_run_stage_job(
+        ep_id=req.ep_id,
+        run_id=req.run_id,
+        stage="cluster",
+        params=params,
+        source="legacy_celery",
+    )
+    response.setdefault("state", response.get("status"))
+    response.setdefault("execution_mode", "redis")
     return response
-
-
-# =============================================================================
-# Enhancement #1: Parallel Job Execution Endpoints
-# =============================================================================
-
-
-class ParallelJobRequest(BaseModel):
-    """Request model for running parallel jobs across multiple episodes."""
-    episode_ids: List[str] = Field(..., description="List of episode IDs to process")
-    operation: str = Field(..., description="Operation to run: auto_group, refresh_similarity, manual_assign")
-    options: Optional[Dict[str, Any]] = Field(None, description="Options to pass to each task")
 
 
 @router.post("/parallel")
