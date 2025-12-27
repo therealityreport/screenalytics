@@ -7,16 +7,19 @@ from fastapi.testclient import TestClient
 
 from apps.api.main import app
 from apps.api.services.storage import StorageService
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
-def _setup_track(tmp_path: Path, count: int = 3) -> str:
+def _setup_track(tmp_path: Path, count: int = 3) -> tuple[str, str]:
     data_root = tmp_path / "data"
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     os.environ["STORAGE_BACKEND"] = "local"
     os.environ.pop("SCREENALYTICS_CROPS_FALLBACK_ROOT", None)
     ep_id = "demo-s01e01"
+    run_id = "run-crops-1"
     ensure_dirs(ep_id)
+    run_layout.run_root(ep_id, run_id).mkdir(parents=True, exist_ok=True)
     track_dir = get_path(ep_id, "frames_root") / "crops" / "track_0001"
     track_dir.mkdir(parents=True, exist_ok=True)
     entries = []
@@ -31,17 +34,19 @@ def _setup_track(tmp_path: Path, count: int = 3) -> str:
             }
         )
     (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    return ep_id
+    return ep_id, run_id
 
 
-def _setup_legacy_track(tmp_path: Path, count: int = 2) -> str:
+def _setup_legacy_track(tmp_path: Path, count: int = 2) -> tuple[str, str]:
     data_root = tmp_path / "primary"
     legacy_root = tmp_path / "legacy"
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     os.environ["STORAGE_BACKEND"] = "local"
     os.environ["SCREENALYTICS_CROPS_FALLBACK_ROOT"] = str(legacy_root)
     ep_id = "legacy-s01e01"
+    run_id = "run-legacy-1"
     ensure_dirs(ep_id)
+    run_layout.run_root(ep_id, run_id).mkdir(parents=True, exist_ok=True)
     track_dir = legacy_root / ep_id / "tracks" / "track_0001"
     track_dir.mkdir(parents=True, exist_ok=True)
     entries = []
@@ -56,11 +61,11 @@ def _setup_legacy_track(tmp_path: Path, count: int = 2) -> str:
             }
         )
     (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    return ep_id
+    return ep_id, run_id
 
 
-def _write_faces(ep_id: str, count: int = 3, track_id: int = 1) -> None:
-    faces_path = get_path(ep_id, "detections").parent / "faces.jsonl"
+def _write_faces(ep_id: str, run_id: str, count: int = 3, track_id: int = 1) -> None:
+    faces_path = run_layout.run_root(ep_id, run_id) / "faces.jsonl"
     entries = []
     for idx in range(count):
         entries.append(
@@ -82,12 +87,12 @@ def _write_faces(ep_id: str, count: int = 3, track_id: int = 1) -> None:
 
 @pytest.mark.parametrize("sample", [1, 2])
 def test_list_track_crops_local_pagination(tmp_path, sample):
-    ep_id = _setup_track(tmp_path, count=4)
+    ep_id, run_id = _setup_track(tmp_path, count=4)
     client = TestClient(app)
 
     resp = client.get(
         f"/episodes/{ep_id}/tracks/1/crops",
-        params={"sample": sample, "limit": 1},
+        params={"sample": sample, "limit": 1, "run_id": run_id},
     )
     assert resp.status_code == 200
     payload = resp.json()
@@ -101,7 +106,7 @@ def test_list_track_crops_local_pagination(tmp_path, sample):
 
     resp2 = client.get(
         f"/episodes/{ep_id}/tracks/1/crops",
-        params={"sample": sample, "limit": 2, "start_after": cursor},
+        params={"sample": sample, "limit": 2, "start_after": cursor, "run_id": run_id},
     )
     assert resp2.status_code == 200
     payload2 = resp2.json()
@@ -113,12 +118,12 @@ def test_list_track_crops_local_pagination(tmp_path, sample):
 
 
 def test_list_track_crops_sampling_respects_cursor(tmp_path):
-    ep_id = _setup_track(tmp_path, count=5)
+    ep_id, run_id = _setup_track(tmp_path, count=5)
     client = TestClient(app)
 
     resp = client.get(
         f"/episodes/{ep_id}/tracks/1/crops",
-        params={"sample": 2, "limit": 1},
+        params={"sample": 2, "limit": 1, "run_id": run_id},
     )
     payload = resp.json()
     cursor = payload["next_start_after"]
@@ -126,7 +131,7 @@ def test_list_track_crops_sampling_respects_cursor(tmp_path):
 
     resp2 = client.get(
         f"/episodes/{ep_id}/tracks/1/crops",
-        params={"sample": 2, "limit": 1, "start_after": cursor},
+        params={"sample": 2, "limit": 1, "start_after": cursor, "run_id": run_id},
     )
     payload2 = resp2.json()
     assert payload2["items"], "expected another sampled crop"
@@ -138,6 +143,7 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     ep_id = "demo-s01e01"
+    run_id = "run-remote-1"
     entries = [
         {"key": "track_0001/frame_000000.jpg", "frame_idx": 0, "ts": 0.0},
         {"key": "track_0001/frame_000010.jpg", "frame_idx": 10, "ts": 0.5},
@@ -172,7 +178,10 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
     monkeypatch.setattr(episodes_router, "STORAGE", storage)
 
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 2})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/crops",
+        params={"sample": 1, "limit": 2, "run_id": run_id},
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert len(payload["items"]) == 2
@@ -180,9 +189,12 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
 
 
 def test_list_track_crops_uses_fallback_root(tmp_path):
-    ep_id = _setup_legacy_track(tmp_path, count=2)
+    ep_id, run_id = _setup_legacy_track(tmp_path, count=2)
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 5})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/crops",
+        params={"sample": 1, "limit": 5, "run_id": run_id},
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["items"], "expected crops from fallback root"
@@ -191,12 +203,12 @@ def test_list_track_crops_uses_fallback_root(tmp_path):
 
 
 def test_track_frames_endpoint_returns_media(tmp_path):
-    ep_id = _setup_track(tmp_path, count=4)
-    _write_faces(ep_id, count=4)
+    ep_id, run_id = _setup_track(tmp_path, count=4)
+    _write_faces(ep_id, run_id, count=4)
     client = TestClient(app)
     resp = client.get(
         f"/episodes/{ep_id}/tracks/1/frames",
-        params={"sample": 1, "page": 1, "page_size": 2},
+        params={"sample": 1, "page": 1, "page_size": 2, "run_id": run_id},
     )
     assert resp.status_code == 200
     payload = resp.json()
@@ -211,12 +223,14 @@ def test_track_frames_endpoint_falls_back_when_no_crops(tmp_path):
     data_root = tmp_path / "data"
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     ep_id = "nogrid-s01e01"
+    run_id = "run-frames-1"
     ensure_dirs(ep_id)
-    _write_faces(ep_id, count=2)
+    run_layout.run_root(ep_id, run_id).mkdir(parents=True, exist_ok=True)
+    _write_faces(ep_id, run_id, count=2)
     client = TestClient(app)
     resp = client.get(
         f"/episodes/{ep_id}/tracks/1/frames",
-        params={"sample": 1, "page": 1, "page_size": 5},
+        params={"sample": 1, "page": 1, "page_size": 5, "run_id": run_id},
     )
     assert resp.status_code == 200
     payload = resp.json()
@@ -225,10 +239,10 @@ def test_track_frames_endpoint_falls_back_when_no_crops(tmp_path):
 
 
 def test_track_integrity_counts_faces_and_crops(tmp_path):
-    ep_id = _setup_track(tmp_path, count=3)
-    _write_faces(ep_id, count=3)
+    ep_id, run_id = _setup_track(tmp_path, count=3)
+    _write_faces(ep_id, run_id, count=3)
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/integrity")
+    resp = client.get(f"/episodes/{ep_id}/tracks/1/integrity", params={"run_id": run_id})
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["faces_manifest"] == 3

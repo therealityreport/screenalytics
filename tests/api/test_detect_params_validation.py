@@ -23,9 +23,13 @@ def test_detect_track_invalid_detector(tmp_path, monkeypatch):
     jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=1)
 
     client = TestClient(app)
-    response = client.post("/jobs/detect_track", json={"ep_id": ep_id, "detector": "yolov8face"})
+    response = client.post(
+        "/jobs/detect_track",
+        json={"ep_id": ep_id, "run_id": "run-validate-1", "detector": "yolov8face"},
+    )
     assert response.status_code == 400
-    assert "Unsupported detector" in response.json().get("detail", "")
+    detail = response.json().get("detail") or response.json().get("message", "")
+    assert "Unsupported detector" in detail
 
 
 def test_detect_track_invalid_tracker(tmp_path, monkeypatch):
@@ -43,10 +47,11 @@ def test_detect_track_invalid_tracker(tmp_path, monkeypatch):
     client = TestClient(app)
     response = client.post(
         "/jobs/detect_track",
-        json={"ep_id": ep_id, "tracker": "nope"},
+        json={"ep_id": ep_id, "run_id": "run-validate-2", "tracker": "nope"},
     )
     assert response.status_code == 400
-    assert "Unsupported tracker" in response.json().get("detail", "")
+    detail = response.json().get("detail") or response.json().get("message", "")
+    assert "Unsupported tracker" in detail
 
 
 def test_detect_track_retinaface_missing_models_returns_400(tmp_path, monkeypatch):
@@ -75,8 +80,8 @@ def test_detect_track_retinaface_missing_models_returns_400(tmp_path, monkeypatc
     client = TestClient(app)
     response = client.post(
         "/jobs/detect_track",
-        json={"ep_id": ep_id, "device": "cpu", "detector": "retinaface"},
+        json={"ep_id": ep_id, "run_id": "run-validate-3", "device": "cpu", "detector": "retinaface"},
     )
     assert response.status_code == 400
-    detail = response.json().get("detail", "")
+    detail = response.json().get("detail") or response.json().get("message", "")
     assert "RetinaFace weights missing or could not initialize" in detail

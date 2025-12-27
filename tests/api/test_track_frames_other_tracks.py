@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
@@ -25,6 +26,7 @@ def _write_jsonl(path, rows) -> None:
 def test_track_frames_include_other_tracks_hint(tmp_path):
     client = TestClient(app)
     ep_id = "demo-s01e03"
+    run_id = "run-frames-other-1"
     ensure_dirs(ep_id)
     frames_root = get_path(ep_id, "frames_root")
     crop_dir = frames_root / "crops" / "track_0001"
@@ -32,9 +34,10 @@ def test_track_frames_include_other_tracks_hint(tmp_path):
     crop_path = crop_dir / "frame_000010.jpg"
     crop_path.write_bytes(b"x")
 
-    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir = run_layout.run_root(ep_id, run_id)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
     faces_path = manifests_dir / "faces.jsonl"
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
 
     _write_jsonl(
         faces_path,
@@ -68,7 +71,7 @@ def test_track_frames_include_other_tracks_hint(tmp_path):
         ],
     )
 
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/frames")
+    resp = client.get(f"/episodes/{ep_id}/tracks/1/frames", params={"run_id": run_id})
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["total"] == 1

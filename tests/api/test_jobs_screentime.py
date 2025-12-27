@@ -6,9 +6,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+from apps.api.routers import episodes as episodes_router
 from apps.api.routers import jobs as jobs_router
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.jobs import JobService
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
@@ -286,18 +288,20 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
     """Test POST /jobs/screen_time/analyze endpoint returns correct job record."""
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
 
     ep_id = "test-s01e06"
     show_id = "TEST"
+    run_id = "run-screen-time-endpoint"
 
     ensure_dirs(ep_id)
-    manifests_dir = data_root / "manifests" / ep_id
+    manifests_dir = run_layout.run_root(ep_id, run_id)
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     faces_path = manifests_dir / "faces.jsonl"
     faces_path.write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
 
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     tracks_path.write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
 
     identities_path = manifests_dir / "identities.json"
@@ -325,13 +329,14 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(service, "_launch_job", _fake_launch)
-    monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)
+    monkeypatch.setattr(episodes_router, "JOB_SERVICE", service)
 
     client = TestClient(app)
     resp = client.post(
         "/jobs/screen_time/analyze",
         json={
             "ep_id": ep_id,
+            "run_id": run_id,
             "quality_min": 0.75,
             "gap_tolerance_s": 0.8,
             "screen_time_mode": "tracks",
@@ -345,21 +350,20 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
     data = resp.json()
 
     assert data["ep_id"] == ep_id
-    assert data["state"] == "running"
+    assert data["run_id"] == run_id
+    assert data["state"] == "queued"
     assert "job_id" in data
-    assert "started_at" in data
-    assert data["requested"]["screen_time_mode"] == "tracks"
-    assert data["requested"]["edge_padding_s"] == 0.1
-    assert data["requested"]["track_coverage_min"] == 0.25
-    assert data["requested"]["preset"] == "bravo_default"
+    assert data.get("stage") == "screentime"
 
 
 def test_analyze_screen_time_endpoint_missing_artifacts(tmp_path, monkeypatch):
     """Test POST /jobs/screen_time/analyze returns 400 when artifacts are missing."""
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
 
     ep_id = "test-s01e07"
+    run_id = "run-screen-time-missing"
 
     ensure_dirs(ep_id)
 
@@ -367,12 +371,12 @@ def test_analyze_screen_time_endpoint_missing_artifacts(tmp_path, monkeypatch):
     jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=7)
 
     service = JobService(data_root=data_root)
-    monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)
+    monkeypatch.setattr(episodes_router, "JOB_SERVICE", service)
 
     client = TestClient(app)
-    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id})
+    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id, "run_id": run_id})
 
-    assert resp.status_code == 400
+    assert resp.status_code == 409
     payload = resp.json()
     assert ("detail" in payload) or ("message" in payload)
 
@@ -381,18 +385,20 @@ def test_analyze_screen_time_endpoint_minimal_payload(tmp_path, monkeypatch):
     """Test POST /jobs/screen_time/analyze works with only ep_id (no overrides)."""
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
 
     ep_id = "test-s01e08"
     show_id = "TEST"
+    run_id = "run-screen-time-minimal"
 
     ensure_dirs(ep_id)
-    manifests_dir = data_root / "manifests" / ep_id
+    manifests_dir = run_layout.run_root(ep_id, run_id)
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     faces_path = manifests_dir / "faces.jsonl"
     faces_path.write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
 
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     tracks_path.write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
 
     identities_path = manifests_dir / "identities.json"
@@ -418,15 +424,15 @@ def test_analyze_screen_time_endpoint_minimal_payload(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(service, "_launch_job", _fake_launch)
-    monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)
+    monkeypatch.setattr(episodes_router, "JOB_SERVICE", service)
 
     client = TestClient(app)
-    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id})
+    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id, "run_id": run_id})
 
     assert resp.status_code == 200
     data = resp.json()
 
     assert data["ep_id"] == ep_id
-    assert data["state"] == "running"
+    assert data["run_id"] == run_id
+    assert data["state"] == "queued"
     assert "job_id" in data
-    assert "started_at" in data

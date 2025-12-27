@@ -3,19 +3,24 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Tuple
 
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
-def write_sample_tracks(ep_id: str, sample_count: int = 5) -> None:
+def write_sample_tracks(ep_id: str, sample_count: int = 5, run_id: str | None = None) -> None:
     """Create a minimal tracks.jsonl with a handful of sampled faces."""
     ensure_dirs(ep_id)
     video_path = get_path(ep_id, "video")
     video_path.parent.mkdir(parents=True, exist_ok=True)
     if not video_path.exists():
         video_path.write_bytes(b"fake-video")
-    manifests_dir = get_path(ep_id, "detections").parent
-    tracks_path = manifests_dir / "tracks.jsonl"
-    tracks_path.parent.mkdir(parents=True, exist_ok=True)
+    if run_id:
+        tracks_path = run_layout.run_root(ep_id, run_id) / "tracks.jsonl"
+        tracks_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        manifests_dir = get_path(ep_id, "detections").parent
+        tracks_path = manifests_dir / "tracks.jsonl"
+        tracks_path.parent.mkdir(parents=True, exist_ok=True)
     samples = []
     for idx in range(max(sample_count, 1)):
         samples.append(
@@ -33,11 +38,15 @@ def write_sample_tracks(ep_id: str, sample_count: int = 5) -> None:
     tracks_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
 
-def write_sample_faces(ep_id: str, face_count: int = 5) -> None:
+def write_sample_faces(ep_id: str, face_count: int = 5, run_id: str | None = None) -> None:
     ensure_dirs(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
-    faces_path = manifests_dir / "faces.jsonl"
-    faces_path.parent.mkdir(parents=True, exist_ok=True)
+    if run_id:
+        faces_path = run_layout.run_root(ep_id, run_id) / "faces.jsonl"
+        faces_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        manifests_dir = get_path(ep_id, "detections").parent
+        faces_path = manifests_dir / "faces.jsonl"
+        faces_path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for idx in range(max(face_count, 1)):
         rows.append(

@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+from py_screenalytics import run_layout
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
@@ -30,10 +31,12 @@ def _write_jsonl(path, rows) -> None:
 def test_cluster_summary_endpoint(tmp_path):
     client = TestClient(app)
     ep_id = "demo-s01e01"
+    run_id = "run-summary-1"
     ensure_dirs(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir = run_layout.run_root(ep_id, run_id)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
     faces_path = manifests_dir / "faces.jsonl"
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     identities_path = manifests_dir / "identities.json"
     frames_root = get_path(ep_id, "frames_root")
     crop_dir = frames_root / "crops" / "track_0001"
@@ -76,7 +79,7 @@ def test_cluster_summary_endpoint(tmp_path):
         },
     )
 
-    resp = client.get(f"/episodes/{ep_id}/cluster_tracks")
+    resp = client.get(f"/episodes/{ep_id}/cluster_tracks", params={"run_id": run_id})
     assert resp.status_code == 200
     data = resp.json()
     assert data["ep_id"] == ep_id
@@ -91,10 +94,12 @@ def test_cluster_summary_endpoint(tmp_path):
 def test_cluster_tracks_include_skipped_face_previews(tmp_path):
     client = TestClient(app)
     ep_id = "demo-s01e02"
+    run_id = "run-skipped-1"
     ensure_dirs(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir = run_layout.run_root(ep_id, run_id)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
     faces_path = manifests_dir / "faces.jsonl"
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     identities_path = manifests_dir / "identities.json"
     frames_root = get_path(ep_id, "frames_root")
     crop_dir = frames_root / "crops" / "track_0002"
@@ -137,7 +142,7 @@ def test_cluster_tracks_include_skipped_face_previews(tmp_path):
         },
     )
 
-    resp = client.get(f"/episodes/{ep_id}/cluster_tracks")
+    resp = client.get(f"/episodes/{ep_id}/cluster_tracks", params={"run_id": run_id})
     assert resp.status_code == 200
     track = resp.json()["clusters"][0]["tracks"][0]
     assert track["track_id"] == 2
@@ -149,10 +154,12 @@ def test_cluster_tracks_include_skipped_face_previews(tmp_path):
 def test_cluster_tracks_prefer_best_quality_thumb(tmp_path):
     client = TestClient(app)
     ep_id = "demo-s01e03"
+    run_id = "run-best-thumb-1"
     ensure_dirs(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir = run_layout.run_root(ep_id, run_id)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
     faces_path = manifests_dir / "faces.jsonl"
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     identities_path = manifests_dir / "identities.json"
     frames_root = get_path(ep_id, "frames_root")
     crops_dir = frames_root / "crops" / "track_0003"
@@ -202,7 +209,7 @@ def test_cluster_tracks_prefer_best_quality_thumb(tmp_path):
         },
     )
 
-    resp = client.get(f"/episodes/{ep_id}/cluster_tracks")
+    resp = client.get(f"/episodes/{ep_id}/cluster_tracks", params={"run_id": run_id})
     assert resp.status_code == 200
     track = resp.json()["clusters"][0]["tracks"][0]
     assert track["track_id"] == 3
