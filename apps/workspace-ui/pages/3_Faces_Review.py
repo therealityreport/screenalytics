@@ -1217,13 +1217,13 @@ def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, A
                         st.error("Failed to start job. See API logs.")
 
     faces_source = faces_artifacts.get("source") or "unknown"
-    faces_manifest_path = faces_artifacts.get("manifest_path") or faces_artifacts.get("path")
+    faces_manifest_key = faces_artifacts.get("manifest_key") or faces_artifacts.get("s3_key")
     faces_manifest_exists = faces_artifacts.get("manifest_exists")
     if faces_manifest_exists is None:
         faces_manifest_exists = faces_artifacts.get("exists")
-    if faces_manifest_path:
+    if faces_manifest_key:
         st.caption(
-            f"Faces source: {faces_source} · manifest: {faces_manifest_path} "
+            f"Faces source: {faces_source} · manifest: {faces_manifest_key} "
             f"({'present' if faces_manifest_exists else 'missing'})"
         )
 

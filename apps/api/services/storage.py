@@ -281,7 +281,7 @@ class StorageService:
             boto3_mod = _boto3()
             if boto3_mod is None:
                 self._fallback_to_local(
-                    "boto3 unavailable for STORAGE_BACKEND=s3; install boto3 or set STORAGE_BACKEND=local"
+                    "boto3 unavailable for STORAGE_BACKEND=s3; install boto3 or configure MinIO/S3"
                 )
             else:
                 from botocore.exceptions import ClientError  # type: ignore
@@ -299,7 +299,7 @@ class StorageService:
             boto3_mod = _boto3()
             if boto3_mod is None:
                 self._fallback_to_local(
-                    "boto3 unavailable for STORAGE_BACKEND=minio; install boto3 or set STORAGE_BACKEND=local"
+                    "boto3 unavailable for STORAGE_BACKEND=minio; install boto3 or configure MinIO/S3"
                 )
             else:
                 from botocore.client import Config  # type: ignore
@@ -322,6 +322,7 @@ class StorageService:
                 self._client_error_cls = ClientError
         elif self.backend == "local":
             self.bucket = "local"
+            self.init_error = "Local storage backend is disabled; use STORAGE_BACKEND=s3 or STORAGE_BACKEND=minio."
         else:
             raise ValueError(f"Unsupported STORAGE_BACKEND '{self.backend}'")
 
@@ -333,16 +334,12 @@ class StorageService:
         self._init_facebank_storage()
 
     def _fallback_to_local(self, reason: str) -> None:
-        """Downgrade to local storage when optional deps are missing."""
+        """Record a storage init error without falling back to local."""
 
         if self._backend_fallback_applied:
             return
         self.init_error = reason
         LOGGER.warning("[storage] %s", reason)
-        self.backend = "local"
-        self.bucket = "local"
-        self._client = None
-        self._client_error_cls = None
         self._backend_fallback_applied = True
 
     def _init_facebank_storage(self) -> None:
@@ -462,9 +459,9 @@ class StorageService:
         headers = {"Content-Type": content_type}
 
         if self.backend == "local":
-            upload_url = f"{LOCAL_UPLOAD_BASE}/{object_key}"
-            method = "FILE"
-            path = object_key
+            raise RuntimeError(
+                "Local storage backend is disabled; use STORAGE_BACKEND=s3 or STORAGE_BACKEND=minio."
+            )
         else:
             assert self._client is not None  # for mypy
             params = {
@@ -959,10 +956,6 @@ class StorageService:
                     candidate_roots.append(root_path)
         if not candidate_roots:
             candidate_roots.append(crops_root)
-            fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-            legacy_root = fallback_root / ep_id / "tracks"
-            if legacy_root not in candidate_roots:
-                candidate_roots.append(legacy_root)
         base_root: Path | None = None
         entries: List[Dict[str, Any]] = []
         for root in candidate_roots:

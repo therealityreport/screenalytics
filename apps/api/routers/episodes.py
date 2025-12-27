@@ -53,6 +53,12 @@ from apps.api.services.storage import (
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
+
+
+def _require_s3_storage() -> None:
+    if STORAGE.backend not in {"s3", "minio"} or STORAGE._client is None or not STORAGE.bucket:
+        detail = STORAGE.init_error or "S3 is not configured for media access."
+        raise HTTPException(status_code=503, detail=f"S3 misconfigured: {detail}")
 JOB_SERVICE = JobService()
 LOGGER = logging.getLogger(__name__)
 
@@ -289,11 +295,6 @@ def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> s
                         return url
             except (ValueError, KeyError):
                 pass
-
-        if normalized:
-            local_path = get_path(ep_id, "frames_root") / normalized
-            if local_path.exists():
-                return str(local_path)
 
     return None
 
@@ -1195,10 +1196,6 @@ def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> 
         except (ValueError, KeyError):
             pass
 
-        local_path = _thumbs_root(ep_id) / rel_path
-        if local_path.exists():
-            return str(local_path)
-
     return None
 
 
@@ -1326,47 +1323,28 @@ def _track_crop_candidates(
         return candidates
     frames_root = get_path(ep_id, "frames_root")
     primary = frames_root / "crops" / track_component
-    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy = fallback_root / ep_id / "tracks" / track_component
-    for path in (primary, legacy):
-        if path not in candidates:
-            candidates.append(path)
+    if primary not in candidates:
+        candidates.append(primary)
     return candidates
 
 
-def _resolve_crops_roots(ep_id: str, run_id: str) -> tuple[List[Path], str]:
-    roots: List[Path] = []
+def _resolve_crops_prefix(ep_id: str, run_id: str) -> tuple[str | None, str]:
+    prefix: str | None = None
     source = "unknown"
     try:
         bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id)
         run_state_payload = bundle.get("run_state") if isinstance(bundle, dict) else None
         artifacts = run_state_payload.get("artifacts") if isinstance(run_state_payload, dict) else {}
         crops = artifacts.get("crops") if isinstance(artifacts, dict) else {}
-        run_prefix = crops.get("run_prefix")
-        legacy_prefix = crops.get("legacy_prefix")
-        if run_prefix:
-            roots.append(Path(run_prefix))
-        if legacy_prefix:
-            legacy_path = Path(legacy_prefix)
-            if legacy_path not in roots:
-                roots.append(legacy_path)
-        if crops.get("run_exists"):
-            source = "run"
-        elif crops.get("legacy_exists"):
-            source = "legacy"
+        prefix = crops.get("s3_prefix")
+        if prefix:
+            source = "run_state"
     except Exception as exc:
         LOGGER.debug("[crops] run_state unavailable for %s/%s: %s", ep_id, run_id, exc)
-    if not roots:
-        frames_root = get_path(ep_id, "frames_root")
-        roots = [frames_root / "runs" / run_id / "crops", frames_root / "crops"]
-        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "")).expanduser()
-        if str(fallback_root):
-            legacy_root = fallback_root / ep_id / "tracks"
-            if legacy_root not in roots:
-                roots.append(legacy_root)
-        if source == "unknown":
-            source = "legacy"
-    return roots, source
+    if not prefix:
+        prefix = f"{run_layout.run_s3_prefix(ep_id, run_id)}crops/"
+        source = "default"
+    return prefix, source
 
 
 def _load_crop_index(path: Path) -> List[Dict[str, Any]]:
@@ -1476,12 +1454,8 @@ def _list_track_frame_media(
         if tid != track_id:
             continue
         face_rows.setdefault(frame_idx, row)
-    crops_roots: List[Path] | None = None
-    if run_id:
-        crops_roots, _ = _resolve_crops_roots(ep_id, run_id)
-    crops = _discover_crop_entries(ep_id, track_id, crops_roots=crops_roots)
-    ctx, prefixes = _require_episode_context(ep_id)
-    crops_prefix = (prefixes or {}).get("crops") if prefixes else None
+    crops: List[Dict[str, Any]] = []
+    crops_prefix: str | None = None
 
     # Load track centroid for similarity computation and quality scoring functions
     try:
@@ -1622,14 +1596,12 @@ def _list_track_frame_media(
         # Without this, the UI would show frames that can't be moved/deleted
         if not meta:
             continue
-        local_path = entry.get("abs_path")
-        local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
         s3_key = None
         if crops_prefix and rel_path:
             suffix = rel_path.split("crops/", 1)[-1]
             s3_key = f"{crops_prefix}{suffix}"
-        media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
+        media_url = _resolve_crop_url(ep_id, rel_path, s3_key)
         fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
         url = media_url or fallback
 
@@ -1694,7 +1666,7 @@ def _count_track_crops(
     ctx,
     track_id: int,
     *,
-    crops_roots: List[Path] | None = None,
+    crops_prefix: str | None = None,
 ) -> int:
     total = 0
     cursor: str | None = None
@@ -1705,7 +1677,7 @@ def _count_track_crops(
             sample=1,
             max_keys=500,
             start_after=cursor,
-            crops_roots=crops_roots,
+            crops_prefix=crops_prefix,
         )
         items = payload.get("items", []) if isinstance(payload, dict) else []
         total += len(items)
@@ -2832,6 +2804,7 @@ def get_run_screentime(
         run_id_norm = run_layout.normalize_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     exports: dict = {}
     try:
         state = run_state_service.get_state(ep_id=ep_id_norm, run_id=run_id_norm)
@@ -2840,11 +2813,6 @@ def get_run_screentime(
         exports = artifacts.get("exports") if isinstance(artifacts, dict) else {}
     except Exception as exc:
         LOGGER.debug("[screentime] run_state unavailable for %s/%s: %s", ep_id_norm, run_id_norm, exc)
-        run_root = run_layout.run_root(ep_id_norm, run_id_norm)
-        exports = {
-            "screentime_json": {"path": str(run_root / "analytics" / "screentime.json")},
-            "screentime_csv": {"path": str(run_root / "analytics" / "screentime.csv")},
-        }
 
     format_value = (output or "json").strip().lower()
     if format_value not in {"json", "csv"}:
@@ -2852,19 +2820,23 @@ def get_run_screentime(
 
     if format_value == "csv":
         csv_entry = exports.get("screentime_csv") if isinstance(exports, dict) else None
-        csv_path = Path(csv_entry.get("path")) if isinstance(csv_entry, dict) else None
-        if not csv_path or not csv_path.exists():
+        csv_key = csv_entry.get("s3_key") if isinstance(csv_entry, dict) else None
+        if not csv_key:
             raise HTTPException(status_code=404, detail="screentime.csv not found")
-        return FileResponse(csv_path, media_type="text/csv", filename=csv_path.name)
+        url = STORAGE.presign_get(csv_key, content_type="text/csv")
+        if not url:
+            raise HTTPException(status_code=503, detail="S3 misconfigured: failed to presign screentime.csv")
+        return {"ep_id": ep_id_norm, "run_id": run_id_norm, "url": url, "s3_key": csv_key}
 
     json_entry = exports.get("screentime_json") if isinstance(exports, dict) else None
-    json_path = Path(json_entry.get("path")) if isinstance(json_entry, dict) else None
-    if not json_path or not json_path.exists():
+    json_key = json_entry.get("s3_key") if isinstance(json_entry, dict) else None
+    if not json_key:
         raise HTTPException(status_code=404, detail="screentime.json not found")
     try:
-        payload = json.loads(json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read screentime.json: {exc}") from exc
+        response = STORAGE._client.get_object(Bucket=STORAGE.bucket, Key=json_key)
+        payload = json.loads(response["Body"].read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read screentime.json from S3: {exc}") from exc
     if isinstance(payload, dict):
         payload.setdefault("ep_id", ep_id_norm)
         payload.setdefault("run_id", run_id_norm)
@@ -3000,9 +2972,13 @@ def presign_episode_assets(ep_id: str) -> AssetUploadResponse:
     if not record:
         raise HTTPException(status_code=404, detail="Episode not found")
 
+    _require_s3_storage()
     ensure_dirs(ep_id)
     v2_key = STORAGE.video_object_key_v2(record.show_ref, record.season_number, record.episode_number)
-    presigned = STORAGE.presign_episode_video(ep_id, object_key=v2_key)
+    try:
+        presigned = STORAGE.presign_episode_video(ep_id, object_key=v2_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     local_video_path = get_path(ep_id, "video")
     path = presigned.path or (str(local_video_path) if presigned.method == "FILE" else None)
 
@@ -3794,6 +3770,7 @@ def list_cluster_tracks(
         run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     try:
         payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster, run_id=run_id_norm)
     except ValueError as exc:
@@ -5133,15 +5110,16 @@ def list_track_crops(
         run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     ctx, _ = _require_episode_context(ep_id)
-    crops_roots, crops_source = _resolve_crops_roots(ep_id, run_id_norm)
+    crops_prefix, crops_source = _resolve_crops_prefix(ep_id, run_id_norm)
     payload = STORAGE.list_track_crops(
         ctx,
         track_id,
         sample=sample,
         max_keys=limit,
         start_after=start_after,
-        crops_roots=crops_roots,
+        crops_prefix=crops_prefix,
     )
     face_rows = _track_face_rows(ep_id, track_id, run_id=run_id_norm)
     items = payload.get("items", []) if isinstance(payload, dict) else []
@@ -5197,6 +5175,7 @@ def list_track_frames(
         run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     return _list_track_frame_media(
         ep_id,
         track_id,
@@ -5223,6 +5202,7 @@ def track_integrity(
         run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     # Load ALL faces including skipped to get accurate counts
     all_faces = _load_faces(ep_id, include_skipped=True, run_id=run_id_norm)
     track_faces = [f for f in all_faces if f.get("track_id") == track_id]
@@ -5232,8 +5212,8 @@ def track_integrity(
     active_faces = total_faces - skipped_faces
 
     ctx, _ = _require_episode_context(ep_id)
-    crops_roots, crops_source = _resolve_crops_roots(ep_id, run_id_norm)
-    crops = _count_track_crops(ctx, track_id, crops_roots=crops_roots)
+    crops_prefix, crops_source = _resolve_crops_prefix(ep_id, run_id_norm)
+    crops = _count_track_crops(ctx, track_id, crops_prefix=crops_prefix)
 
     # Track is OK if it has ANY faces (even if all skipped) and crops exist
     ok = crops >= total_faces > 0

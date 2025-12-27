@@ -157,12 +157,6 @@ def _resolve_crop_path(ep_id: str, face: Dict[str, Any]) -> Optional[Path]:
         if crop_path.exists():
             return crop_path
 
-        # Try fallback root
-        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-        crop_path = fallback_root / ep_id / crop_rel.replace("crops/", "")
-        if crop_path.exists():
-            return crop_path
-
     # Try thumb_rel_path as fallback
     thumb_rel = face.get("thumb_rel_path")
     if thumb_rel:

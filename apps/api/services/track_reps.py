@@ -128,16 +128,6 @@ def _discover_crop_path(
         if png_path.exists():
             return f"crops/{track_component}/{frame_filename_png}"
 
-    # Fallback locations
-    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy1 = fallback_root / ep_id / "tracks" / track_component / frame_filename_jpg
-    if legacy1.exists():
-        return f"crops/{track_component}/{frame_filename_jpg}"
-
-    legacy1_png = fallback_root / ep_id / "tracks" / track_component / frame_filename_png
-    if legacy1_png.exists():
-        return f"crops/{track_component}/{frame_filename_png}"
-
     return None
 
 
