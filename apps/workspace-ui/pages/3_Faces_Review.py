@@ -1023,15 +1023,15 @@ def _persist_and_refresh_cast_suggestions(
         if isinstance(raw_saved, int):
             saved_count = raw_saved
 
-    cache_buster = int(time.time() * 1000)
-    suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions", params={"_t": cache_buster})
     suggestions_map: Dict[str, List[Dict[str, Any]]] = {}
-    if suggestions_resp:
-        for entry in suggestions_resp.get("suggestions", []):
-            cid = entry.get("cluster_id")
-            if not cid:
-                continue
-            suggestions_map[cid] = entry.get("cast_suggestions", []) or []
+    if _CURRENT_RUN_ID:
+        suggestions_resp = _api_post(
+            f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/jobs/suggest_faces",
+            {"force": True},
+            timeout=90.0,
+        )
+        if suggestions_resp:
+            suggestions_map = suggestions_resp.get("suggestions", {}) or {}
 
     if suggestions_map:
         st.session_state[_cast_suggestions_cache_key(ep_id)] = suggestions_map
@@ -2290,21 +2290,22 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                     st.write(f"✓ Processed {tracks_processed} tracks")
                     st.write(f"✓ Computed {centroids_computed} cluster centroids")
 
-                    # Step 2: Refresh cluster suggestions based on new similarity values
-                    st.write("📊 Refreshing cluster suggestions...")
-                    suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
-
-                    # Step 3: Fetch cast suggestions from facebank (Enhancement #1)
-                    st.write("🎭 Fetching cast suggestions from facebank...")
-                    cast_suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions")
-                    if cast_suggestions_resp and cast_suggestions_resp.get("suggestions"):
-                        # Store in session state for display
-                        st.session_state[_cast_suggestions_cache_key(ep_id)] = {
-                            sugg["cluster_id"]: sugg.get("cast_suggestions", [])
-                            for sugg in cast_suggestions_resp.get("suggestions", [])
-                        }
-                        num_suggestions = len(cast_suggestions_resp.get("suggestions", []))
-                        st.write(f"✓ Found {num_suggestions} cluster(s) with cast suggestions")
+                    # Step 2: Recompute run-scoped cast suggestions
+                    st.write("🎭 Refreshing cast suggestions...")
+                    if not _CURRENT_RUN_ID:
+                        st.warning("Run-scoped suggestions require a run_id.")
+                    else:
+                        cast_suggestions_resp = _api_post(
+                            f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/jobs/suggest_faces",
+                            {"force": True},
+                            timeout=90.0,
+                        )
+                        if cast_suggestions_resp and cast_suggestions_resp.get("suggestions"):
+                            st.session_state[_cast_suggestions_cache_key(ep_id)] = cast_suggestions_resp.get(
+                                "suggestions", {}
+                            )
+                            num_suggestions = len(cast_suggestions_resp.get("suggestions", []))
+                            st.write(f"✓ Found {num_suggestions} cluster(s) with cast suggestions")
 
                     # Update status
                     status.update(label="✅ Refresh complete!", state="complete")
@@ -3335,21 +3336,24 @@ def _render_unassigned_cluster_card(
                 _set_view("cluster_tracks", identity_id=cluster_id)
                 st.rerun()
         with col3:
-            # "Suggest for Me" button (Enhancement #6)
-            if st.button("💡 Suggest", key=f"suggest_me_{cluster_id}", help="Find matching cast members"):
-                with st.spinner("Finding matches..."):
-                    suggest_resp = _safe_api_get(f"/episodes/{ep_id}/clusters/{cluster_id}/suggest_cast")
-                    if suggest_resp and suggest_resp.get("suggestions"):
-                        # Store suggestions in session state
-                        st.session_state[_cast_suggestions_cache_key(ep_id)] = st.session_state.get(
-                            _cast_suggestions_cache_key(ep_id), {}
+            # Recompute run-scoped suggestions
+            if st.button("🔄 Suggestions", key=f"refresh_suggestions_{cluster_id}", help="Recompute cast suggestions"):
+                if not _CURRENT_RUN_ID:
+                    st.warning("Run-scoped suggestions require a run_id.")
+                else:
+                    with st.spinner("Refreshing suggestions..."):
+                        suggest_resp = _api_post(
+                            f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/jobs/suggest_faces",
+                            {"force": True},
+                            timeout=90.0,
                         )
-                        st.session_state[_cast_suggestions_cache_key(ep_id)][cluster_id] = suggest_resp["suggestions"]
-                        st.toast(f"Found {len(suggest_resp['suggestions'])} suggestion(s)!")
-                        st.rerun()
-                    else:
-                        message = suggest_resp.get("message", "No matches found") if suggest_resp else "API error"
-                        st.warning(message)
+                        if suggest_resp and suggest_resp.get("suggestions"):
+                            st.session_state[_cast_suggestions_cache_key(ep_id)] = suggest_resp.get("suggestions", {})
+                            st.toast("Suggestions refreshed.")
+                            st.rerun()
+                        else:
+                            message = suggest_resp.get("message", "No suggestions available") if suggest_resp else "API error"
+                            st.warning(message)
         with col4:
             # Compare button (Feature 3)
             comparison_mode_active = st.session_state.get(f"comparison_mode:{ep_id}", False)
@@ -3574,7 +3578,7 @@ def _render_unassigned_cluster_card(
                 sugg_name = cast_sugg.get("name", sugg_cast_id)
                 sugg_sim = cast_sugg.get("similarity", 0)
                 sugg_confidence = cast_sugg.get("confidence", "low")
-                sugg_source = cast_sugg.get("source", "facebank")
+                sugg_source = cast_sugg.get("method") or cast_sugg.get("source") or "facebank"
                 faces_used = cast_sugg.get("faces_used")
 
                 # Nov 2024: Enhanced with rank context (use filtered list count)
@@ -3594,7 +3598,8 @@ def _render_unassigned_cluster_card(
                 if sugg_source == "frame" and faces_used:
                     source_label = f"frame ({faces_used} face{'s' if faces_used > 1 else ''})"
 
-                sugg_col1, sugg_col2 = st.columns([5, 1])
+                suggestion_id = cast_sugg.get("suggestion_id") or f"{cluster_id}:{sugg_cast_id}"
+                sugg_col1, sugg_col2, sugg_col3 = st.columns([5, 1, 1])
                 with sugg_col1:
                     st.markdown(
                         f'<span style="background-color: {badge_color}; color: white; padding: 2px 8px; '
@@ -3606,29 +3611,27 @@ def _render_unassigned_cluster_card(
                     )
                 with sugg_col2:
                     if st.button("✓", key=f"cast_sugg_assign_{cluster_id}_{idx}", help=f"Assign to {sugg_name}"):
-                        # Find or create person for this cast member
-                        people_resp = _fetch_people_cached(show_id)
-                        people = people_resp.get("people", []) if people_resp else []
-                        target_person = next(
-                            (p for p in people if p.get("cast_id") == sugg_cast_id),
-                            None,
-                        )
-                        target_person_id = target_person.get("person_id") if target_person else None
-
-                        payload = {
-                            "strategy": "manual",
-                            "cluster_ids": [cluster_id],
-                            "target_person_id": target_person_id,
-                            "cast_id": sugg_cast_id,
-                        }
-                        resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                        if resp and resp.get("status") == "success":
+                        if _set_cluster_assignment(ep_id, cluster_id, sugg_cast_id):
                             _invalidate_assignment_caches()
                             st.success(f"Assigned cluster to {sugg_name}!")
                             _focus_cast_members(sugg_cast_id, sugg_name)
                             st.rerun()
                         else:
                             st.error("Failed to assign cluster. Check logs.")
+                with sugg_col3:
+                    if st.button("✕", key=f"cast_sugg_dismiss_{cluster_id}_{idx}", help="Dismiss suggestion"):
+                        if not _CURRENT_RUN_ID:
+                            st.warning("Run-scoped suggestions require a run_id.")
+                        else:
+                            resp = _api_post(
+                                f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/suggestions/dismiss",
+                                {"suggestion_ids": [suggestion_id]},
+                            )
+                            if resp:
+                                st.toast("Suggestion dismissed.")
+                                st.rerun()
+                            else:
+                                st.error("Failed to dismiss suggestion.")
             st.markdown("---")
 
         # Show person-based suggestion if available (existing logic)
@@ -4617,26 +4620,31 @@ def _render_people_view(
             filtered_entities.append(entity_copy)
         unlinked_entities = filtered_entities
 
-    # Suggestions: facebank (cached) and assigned-cluster similarity
-    cast_suggestions_by_cluster = st.session_state.get(_cast_suggestions_cache_key(ep_id), {})
-    assigned_suggestions_by_cluster: Dict[str, Dict[str, Any]] = {}
-    assigned_suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
-    if assigned_suggestions_resp:
-        cast_person_ids = {p.get("person_id") for p in people if p.get("person_id") and p.get("cast_id")}
-        for suggestion in assigned_suggestions_resp.get("suggestions", []):
-            cid = suggestion.get("cluster_id")
-            suggested_person_id = suggestion.get("suggested_person_id")
-            if cid and suggested_person_id in cast_person_ids:
-                assigned_suggestions_by_cluster[cid] = suggestion
+    suggestions_payload = bundle_payload.get("suggestions") if isinstance(bundle_payload.get("suggestions"), dict) else {}
+    suggestions_status = suggestions_payload.get("status") if isinstance(suggestions_payload, dict) else None
+    suggestions_by_cluster = (
+        suggestions_payload.get("suggestions", {})
+        if isinstance(suggestions_payload, dict)
+        else {}
+    )
+    suggestions_meta = (
+        suggestions_payload.get("triage", {})
+        if isinstance(suggestions_payload, dict)
+        else {}
+    )
+    cast_suggestions_by_cluster = (
+        suggestions_by_cluster
+        if isinstance(suggestions_by_cluster, dict)
+        else st.session_state.get(_cast_suggestions_cache_key(ep_id), {})
+    )
+    if cast_suggestions_by_cluster:
+        st.session_state[_cast_suggestions_cache_key(ep_id)] = cast_suggestions_by_cluster
 
-    # Cross-episode suggestions (used by auto-people cards)
-    cross_suggestions_by_cluster: Dict[str, Dict[str, Any]] = {}
-    cross_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions")
-    if cross_resp:
-        for suggestion in cross_resp.get("suggestions", []):
-            cid = suggestion.get("cluster_id")
-            if cid:
-                cross_suggestions_by_cluster[cid] = suggestion
+    assigned_suggestions_by_cluster = {}
+    cross_suggestions_by_cluster = {}
+
+    if suggestions_status in {"missing_cast_embeddings", "missing_identities", "error"}:
+        st.info("Cast suggestions unavailable for this run. Verify face embeddings and S3 configuration.")
 
     # Build separate queues: multi-cluster identities vs single-cluster entries
     multi_cluster_queue: List[Dict[str, Any]] = []  # Identities with >1 cluster
@@ -4742,6 +4750,7 @@ def _render_people_view(
                 # Get cast match score from suggestions if available
                 cid = item.get("cluster_id") or (item.get("episode_clusters", [None])[0])
                 cast_score = 0.0
+                triage_score = 0.0
                 if cid and cid in cast_suggestions_by_cluster:
                     suggestions = cast_suggestions_by_cluster[cid]
                     # Handle both list and dict formats
@@ -4749,6 +4758,10 @@ def _render_people_view(
                         cast_score = suggestions[0].get("similarity", 0.0)
                     elif isinstance(suggestions, dict):
                         cast_score = suggestions.get("similarity", 0.0)
+                if cid and isinstance(suggestions_meta, dict):
+                    triage_entry = suggestions_meta.get(cid, {})
+                    if isinstance(triage_entry, dict):
+                        triage_score = triage_entry.get("triage_score", 0.0) or 0.0
 
                 # Use negative values for descending, positive for ascending
                 # No reverse flag needed - just return appropriate tuple
@@ -4760,6 +4773,8 @@ def _render_people_view(
                     return (-tracks, -faces)
                 elif unassigned_sort_option == "Track Count (Low to High)":
                     return (tracks, faces)
+                elif unassigned_sort_option == "Triage (Impact × Uncertainty)":
+                    return (-triage_score, -faces)
                 elif unassigned_sort_option == "Cast Match Score (High to Low)":
                     return (-cast_score, -faces)
                 elif unassigned_sort_option == "Cast Match Score (Low to High)":
@@ -5568,14 +5583,11 @@ def _render_cluster_tracks(
     suggestions_cache_key = _cast_suggestions_cache_key(ep_id)
     suggestions_map = st.session_state.get(suggestions_cache_key)
     if suggestions_map is None:
-        suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions")
         suggestions_map = {}
-        if suggestions_resp:
-            for entry in suggestions_resp.get("suggestions", []):
-                cid = entry.get("cluster_id")
-                if not cid:
-                    continue
-                suggestions_map[cid] = entry.get("cast_suggestions", []) or []
+        if _CURRENT_RUN_ID:
+            suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/suggestions")
+            if suggestions_resp:
+                suggestions_map = suggestions_resp.get("suggestions", {}) or {}
         st.session_state[suggestions_cache_key] = suggestions_map
     cast_suggestions_for_cluster = suggestions_map.get(identity_id) if suggestions_map else []
     if cast_suggestions_for_cluster:
