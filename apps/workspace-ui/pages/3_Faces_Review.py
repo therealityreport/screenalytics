@@ -638,6 +638,20 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, 
         return None
 
 
+def _fetch_faces_review_bundle(
+    ep_id: str,
+    *,
+    filter_cast_id: str | None = None,
+    include_archived: bool = False,
+) -> Dict[str, Any] | None:
+    params: Dict[str, Any] = {}
+    if filter_cast_id:
+        params["filter_cast_id"] = filter_cast_id
+    if include_archived:
+        params["include_archived"] = "1"
+    return _safe_api_get(f"/episodes/{ep_id}/faces_review_bundle", params=params or None)
+
+
 def _run_scope_token() -> str:
     return _CURRENT_RUN_ID or "legacy"
 
@@ -2787,98 +2801,37 @@ def _add_cluster_to_comparison(ep_id: str, cluster_id: str) -> bool:
     return True
 
 
-def _render_cast_carousel(
-    ep_id: str,
-    show_id: str,
-) -> None:
-    """Render featured cast members carousel at the top - ONLY shows cast with clusters in this episode."""
-    if not show_id:
-        return
-    show_key = str(show_id).lower()
-    refresh_flag = f"cast_carousel_refresh::{show_key}"
-    cache = _cast_carousel_cache()
-    people_cache = _cast_people_cache()
-    if st.session_state.pop(refresh_flag, False):
-        cache.pop(show_key, None)
-        people_cache.pop(show_key, None)
-
-    cast_api_resp = cache.get(show_key)
-    if cast_api_resp is None:
-        # Include featured seed thumbnails for cast gallery display
-        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast", params={"include_featured": "1"})
-        if cast_api_resp:
-            cache[show_key] = cast_api_resp
-    if not cast_api_resp:
-        return
-
-    cast_members = cast_api_resp.get("cast", [])
-    if not cast_members:
-        return
-
-    # Get people data to check who has clusters
-    people_resp = people_cache.get(show_key)
-    if people_resp is None:
-        people_resp = _fetch_people_cached(show_id)
-        if people_resp:
-            people_cache[show_key] = people_resp
-    people = people_resp.get("people", []) if people_resp else []
-    # Build lookup by cast_id, filtering out None/empty/whitespace-only cast_ids
-    people_by_cast_id = {
-        p.get("cast_id"): p
-        for p in people
-        if p.get("cast_id") and isinstance(p.get("cast_id"), str) and p.get("cast_id").strip()
-    }
-
-    # Filter to only cast members with clusters in this episode
-    cast_with_clusters = []
-    for cast in cast_members:
-        cast_id = cast.get("cast_id")
-        person = people_by_cast_id.get(cast_id)
-        if person:
-            episode_clusters = _episode_cluster_ids(person, ep_id)
-            if episode_clusters:
-                cast_with_clusters.append((cast, person, episode_clusters))
-
-    # Don't show carousel if no cast members have clusters in this episode
-    if not cast_with_clusters:
+def _render_cast_carousel(cast_cards: List[Dict[str, Any]]) -> None:
+    """Render featured cast members carousel at the top (run-scoped inputs)."""
+    if not cast_cards:
         return
 
     header_cols = st.columns([3, 1])
     with header_cols[0]:
         st.markdown("### 🎬 Cast Lineup")
         st.caption("Cast members with clusters in this episode")
-    with header_cols[1]:
-        if st.button(
-            "Refresh cast list",
-            key=f"refresh_cast_{show_key}",
-            use_container_width=True,
-        ):
-            st.session_state[refresh_flag] = True
-            st.rerun()
 
     # Create horizontal carousel (max 5 per row)
-    max_cols_per_row = min(len(cast_with_clusters), 5)
+    max_cols_per_row = min(len(cast_cards), 5)
 
-    for row_start in range(0, len(cast_with_clusters), max_cols_per_row):
-        row_items = cast_with_clusters[row_start : row_start + max_cols_per_row]
+    for row_start in range(0, len(cast_cards), max_cols_per_row):
+        row_items = cast_cards[row_start : row_start + max_cols_per_row]
         # Use actual row item count to avoid empty columns on last row
         cols = st.columns(len(row_items))
 
-        for idx, (cast, person, episode_clusters) in enumerate(row_items):
+        for idx, card in enumerate(row_items):
             with cols[idx]:
-                cast_id = cast.get("cast_id")
-                name = cast.get("name", "(unnamed)")
-
-                # Get facebank featured image
-                facebank_resp = _safe_api_get(f"/cast/{cast_id}/facebank?show_id={show_id}")
-                featured_url = None
-                if facebank_resp and facebank_resp.get("featured_seed"):
-                    featured_seed = facebank_resp["featured_seed"]
-                    featured_url = featured_seed.get("display_url")
+                cast_info = card.get("cast") or {}
+                person = card.get("person") or {}
+                cast_id = cast_info.get("cast_id") or person.get("cast_id")
+                name = cast_info.get("name") or person.get("name") or "(unnamed)"
+                episode_clusters = card.get("episode_clusters") or []
+                featured_url = card.get("featured_thumbnail")
 
                 # Display featured image
                 if featured_url:
-                    thumb_markup = helpers.thumb_html(featured_url, alt=name, hide_if_missing=False)
+                    resolved = helpers.resolve_thumb(featured_url)
+                    thumb_markup = helpers.thumb_html(resolved, alt=name, hide_if_missing=False)
                     st.markdown(thumb_markup, unsafe_allow_html=True)
                 else:
                     st.markdown("_No featured image_")
@@ -4318,14 +4271,18 @@ def _render_people_view(
     identity_index: Dict[str, Dict[str, Any]],
     season_label: str | None,
     *,
-    cast_api_resp: Dict[str, Any] | None = None,
+    bundle: Dict[str, Any] | None = None,
 ) -> None:
     # Note: Cast Members header is rendered inline with the count in the section below
     if not show_id:
         st.error("Unable to determine show for this episode.")
         return
 
-    _render_cast_carousel(ep_id, show_id)
+    bundle_payload = bundle or {}
+    cast_gallery_cards = bundle_payload.get("cast_gallery_cards", []) or []
+    cast_options = bundle_payload.get("cast_options", {}) or {}
+    unlinked_entities = bundle_payload.get("unlinked_entities", []) or []
+    _render_cast_carousel(cast_gallery_cards)
 
     # Build people lookup for quick access by person_id
     people_lookup = {str(person.get("person_id") or ""): person for person in people}
@@ -4347,104 +4304,12 @@ def _render_people_view(
     # Load cluster centroids once for all identity cohesion calculations
     cluster_centroids = _load_cluster_centroids(ep_id)
 
-    cast_resp = cast_api_resp if cast_api_resp is not None else _fetch_cast_cached(show_id, season_label)
-    raw_cast_entries = cast_resp.get("cast", []) if cast_resp else []
-    # Build lookup by cast_id, filtering out None/empty/whitespace-only cast_ids
-    people_by_cast_id = {
-        p.get("cast_id"): p
-        for p in people
-        if p.get("cast_id") and isinstance(p.get("cast_id"), str) and p.get("cast_id").strip()
-    }
-
-    deduped_cast_entries: List[Dict[str, Any]] = []
-    seen_cast_ids: set[str] = set()
-    seen_names: set[str] = set()
-    for entry in raw_cast_entries:
-        cast_id = entry.get("cast_id") or ""
-        name = (entry.get("name") or "").strip()
-        norm_name = name.lower()
-        if cast_id and cast_id in seen_cast_ids:
-            continue
-        if not cast_id and norm_name and norm_name in seen_names:
-            continue
-        if cast_id:
-            seen_cast_ids.add(cast_id)
-        if norm_name:
-            seen_names.add(norm_name)
-        deduped_cast_entries.append(entry)
-
-    # Build cast gallery cards by joining cast roster with people metadata
-    cast_gallery_cards: List[Dict[str, Any]] = []
-    for cast_entry in deduped_cast_entries:
-        cast_id = cast_entry.get("cast_id")
-        if not cast_id:
-            continue
-        if filter_cast_id and str(cast_id) != str(filter_cast_id):
-            continue
-        person = people_by_cast_id.get(cast_id)
-        episode_clusters = _episode_cluster_ids(person, ep_id) if person else []
-        if not person or not episode_clusters:
-            continue
-        featured_thumb = cast_entry.get("featured_thumbnail_url")
-        if not featured_thumb and person:
-            featured_thumb = person.get("rep_crop")
-        # Fallback: select best quality crop from episode tracks if no seeded thumbnail
-        if not featured_thumb and episode_clusters:
-            featured_thumb = _get_best_crop_from_clusters(ep_id, episode_clusters)
-        cast_gallery_cards.append(
-            {
-                "cast": cast_entry,
-                "person": person,
-                "episode_clusters": episode_clusters,
-                "featured_thumbnail": featured_thumb,
-            }
-        )
-
     if not people:
         if cast_gallery_cards:
             st.markdown(f"### 🎬 Cast Members ({len(cast_gallery_cards)})")
             st.caption(f"Show-level cast members for {show_id}")
             _render_cast_gallery(ep_id, cast_gallery_cards, cluster_lookup, cluster_centroids)
         st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
-
-    # Include legacy cast/person pairs (absent from cast.json) when they have clusters
-    # Build lookup for cast entries by cast_id to get featured_thumbnail_url
-    cast_entry_by_id = {e.get("cast_id"): e for e in raw_cast_entries if e.get("cast_id")}
-    seen_cast_ids = {card.get("cast", {}).get("cast_id") for card in cast_gallery_cards}
-    for person in people:
-        cast_id = person.get("cast_id")
-        if not cast_id or cast_id in seen_cast_ids:
-            continue
-        if filter_cast_id and str(cast_id) != str(filter_cast_id):
-            continue
-        episode_clusters = _episode_cluster_ids(person, ep_id)
-        if not episode_clusters:
-            continue
-        # Try to get featured_thumbnail_url from cast API first, then rep_crop, then episode crops
-        cast_entry_match = cast_entry_by_id.get(cast_id)
-        featured_thumb = None
-        if cast_entry_match:
-            featured_thumb = cast_entry_match.get("featured_thumbnail_url")
-        if not featured_thumb:
-            featured_thumb = person.get("rep_crop")
-        if not featured_thumb:
-            featured_thumb = _get_best_crop_from_clusters(ep_id, episode_clusters)
-        cast_gallery_cards.append(
-            {
-                "cast": {
-                    "cast_id": cast_id,
-                    "name": person.get("name") or "(unnamed)",
-                    "aliases": person.get("aliases") or [],
-                },
-                "person": person,
-                "episode_clusters": episode_clusters,
-                "featured_thumbnail": featured_thumb,
-            }
-        )
-        seen_cast_ids.add(cast_id)
-
-    # Sort cast members (for gallery) by name
-    cast_gallery_cards.sort(key=lambda card: (card.get("cast", {}).get("name") or "").lower())
 
     # --- CAST MEMBERS SECTION ---
     if cast_gallery_cards:
@@ -4551,8 +4416,6 @@ def _render_people_view(
                 st.info("No archived items for this episode yet.")
 
     # --- NEEDS CAST ASSIGNMENT (UNIFIED) ---
-    unlinked_resp = _fetch_unlinked_entities(ep_id)
-    unlinked_entities = unlinked_resp.get("entities", []) if unlinked_resp else []
 
     # Load dismissed suggestions to filter out skipped items (shared with Smart Suggestions)
     dismissed_resp = _safe_api_get(f"/episodes/{ep_id}/dismissed_suggestions")
@@ -4578,15 +4441,6 @@ def _render_people_view(
             entity_copy["cluster_ids"] = remaining_clusters
             filtered_entities.append(entity_copy)
         unlinked_entities = filtered_entities
-
-    # Build options: map cast_id to name for assignment controls
-    cast_options = {
-        cm.get("cast_id"): cm.get("name") for cm in deduped_cast_entries if cm.get("cast_id") and cm.get("name")
-    }
-    for cast_id, person in people_by_cast_id.items():
-        person_name = person.get("name")
-        if cast_id and person_name and cast_id not in cast_options:
-            cast_options[cast_id] = person_name
 
     # Suggestions: facebank (cached) and assigned-cluster similarity
     cast_suggestions_by_cluster = st.session_state.get(_cast_suggestions_cache_key(ep_id), {})
@@ -6934,30 +6788,18 @@ season_value = ep_meta.get("season")
 if isinstance(season_value, int):
     season_label = f"S{season_value:02d}"
 
-ctx = get_script_run_ctx() if get_script_run_ctx else None
+filter_cast_id = st.session_state.get("filter_cast_id")
+bundle = _fetch_faces_review_bundle(ep_id, filter_cast_id=filter_cast_id)
+if not bundle:
+    st.error("Failed to load Faces Review bundle. Please check that the API is running and the episode has been processed.")
+    st.stop()
 
-
-def _submit_with_ctx(pool: ThreadPoolExecutor, func, *args):
-    if ctx and add_script_run_ctx:
-        def _wrapped():
-            add_script_run_ctx(threading.current_thread(), ctx)
-            return func(*args)
-        return pool.submit(_wrapped)
-    return pool.submit(func, *args)
-
-with ThreadPoolExecutor(max_workers=4) as executor:
-    futures = {
-        "identities": _submit_with_ctx(executor, _fetch_identities_cached, ep_id),
-        "people": _submit_with_ctx(executor, _fetch_people_cached, show_slug),
-        "cast": _submit_with_ctx(executor, _fetch_cast_cached, show_slug, season_label),
-        "cluster_tracks": _submit_with_ctx(executor, _safe_api_get, f"/episodes/{ep_id}/cluster_tracks"),
-        "archived": _submit_with_ctx(executor, _fetch_archived_ids, ep_id, _CURRENT_RUN_ID),
-    }
-    identities_payload = futures["identities"].result()
-    people_resp = futures["people"].result()
-    cast_api_resp = futures["cast"].result()
-    cluster_payload = futures["cluster_tracks"].result() or {"clusters": []}
-    archived_sets = futures["archived"].result() or {}
+identities_payload = bundle.get("identities") or {}
+cluster_payload = bundle.get("cluster_payload") or {"clusters": []}
+people = bundle.get("people") or []
+archived_sets = bundle.get("archived_ids") or {}
+cast_options = bundle.get("cast_options") or {}
+legacy_people_fallback = bool(bundle.get("legacy_people_fallback"))
 
 if not identities_payload:
     st.error("Failed to load identities data. Please check that the API is running and the episode has been processed.")
@@ -6969,75 +6811,11 @@ _show_local_fallback_banner(cluster_payload)
 # Show sync-to-S3 option for missing thumbnails
 _render_sync_to_s3_button(ep_id)
 
-# Remove archived clusters/tracks from cluster payload before building lookup
-archived_clusters: set = archived_sets.get("clusters", set()) if isinstance(archived_sets, dict) else set()
-archived_tracks: set = archived_sets.get("tracks", set()) if isinstance(archived_sets, dict) else set()
-if not isinstance(archived_clusters, set):
-    archived_clusters = set(archived_clusters)
-if not isinstance(archived_tracks, set):
-    archived_tracks = set(archived_tracks)
-
-
-def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, archived_tracks: set) -> Dict[str, Any]:
-    filtered = dict(payload)
-    clusters = []
-    for entry in payload.get("clusters", []):
-        cid = entry.get("cluster_id") or entry.get("identity_id")
-        if cid and str(cid) in archived_clusters:
-            continue
-        entry_copy = dict(entry)
-        tracks_field = entry_copy.get("tracks")
-        filtered_tracks: list[Dict[str, Any]] | None = None
-        tracks_filtered = False
-        faces_total: int | None = None
-        if isinstance(tracks_field, list):
-            filtered_tracks = []
-            for t in tracks_field:
-                tid_val = t.get("track_id") or t.get("track_int") or t.get("track")
-                tid_int = _coerce_track_int(tid_val)
-                if tid_int is not None and tid_int in archived_tracks:
-                    continue
-                filtered_tracks.append(t)
-            if len(filtered_tracks) != len(tracks_field):
-                tracks_filtered = True
-            entry_copy["tracks"] = filtered_tracks
-            faces_seen = False
-            faces_total = 0
-            for t in filtered_tracks:
-                if "faces" in t:
-                    faces_seen = True
-                    faces_total += coerce_int(t.get("faces")) or 0
-            if not faces_seen:
-                faces_total = None
-        reps = entry_copy.get("track_reps") or []
-        cleaned_reps = []
-        for tr in reps:
-            tid_val = tr.get("track_id") or tr.get("track") or tr.get("track_int")
-            tid_int = _coerce_track_int(tid_val)
-            if tid_int is not None and tid_int in archived_tracks:
-                continue
-            cleaned_reps.append(tr)
-        reps_filtered = len(cleaned_reps) != len(reps)
-        if reps_filtered:
-            entry_copy["track_reps"] = cleaned_reps
-        if tracks_filtered or reps_filtered:
-            counts = entry_copy.get("counts")
-            counts = dict(counts) if isinstance(counts, dict) else {}
-            if isinstance(filtered_tracks, list):
-                counts["tracks"] = len(filtered_tracks)
-                if faces_total is not None:
-                    counts["faces"] = faces_total
-            elif reps_filtered:
-                counts["tracks"] = len(cleaned_reps)
-            entry_copy["counts"] = counts
-        clusters.append(entry_copy)
-    filtered["clusters"] = clusters
-    return filtered
-
-
-cluster_payload = _filter_cluster_payload(cluster_payload, archived_clusters, archived_tracks)
-
-# Keep archived sets handy for other views
+# Keep archived sets handy for other views (run-scoped bundle output)
+archived_clusters_raw = archived_sets.get("clusters", []) if isinstance(archived_sets, dict) else []
+archived_tracks_raw = archived_sets.get("tracks", []) if isinstance(archived_sets, dict) else []
+archived_clusters = set(archived_clusters_raw)
+archived_tracks = set(archived_tracks_raw)
 st.session_state[f"{ep_id}::archived_clusters"] = archived_clusters
 st.session_state[f"{ep_id}::archived_tracks"] = archived_tracks
 
@@ -7076,44 +6854,23 @@ identities = identities_payload.get("identities", [])
 identity_index = {ident["identity_id"]: ident for ident in identities}
 # show_slug already defined above - no need to recompute
 roster_names = _fetch_roster_names(show_slug)
-people = people_resp.get("people", []) if people_resp else []
 show_id = show_slug
-run_people, legacy_people = faces_review_run_scoped.filter_people_for_run(
-    people,
-    ep_id,
-    _CURRENT_RUN_ID,
-)
-if _CURRENT_RUN_ID:
-    if run_people:
-        people = run_people
-        _LEGACY_PEOPLE_FALLBACK = False
-    elif legacy_people:
-        people = legacy_people
-        _LEGACY_PEOPLE_FALLBACK = True
-        legacy_warn_key = f"{ep_id}::{_CURRENT_RUN_ID}::faces_review_legacy_people"
-        if not st.session_state.get(legacy_warn_key):
-            st.session_state[legacy_warn_key] = True
-            st.warning(
-                "Showing legacy/global people for this episode (no run-scoped people found). "
-                "These may not match the selected attempt."
-            )
-    else:
-        _LEGACY_PEOPLE_FALLBACK = False
+_LEGACY_PEOPLE_FALLBACK = legacy_people_fallback
+if legacy_people_fallback:
+    legacy_warn_key = f"{ep_id}::{_CURRENT_RUN_ID}::faces_review_legacy_people"
+    if not st.session_state.get(legacy_warn_key):
+        st.session_state[legacy_warn_key] = True
+        st.warning(
+            "Showing legacy/global people for this episode (no run-scoped people found). "
+            "These may not match the selected attempt."
+        )
 people_lookup = {str(person.get("person_id") or ""): person for person in people}
 
 selected_person = st.session_state.get("selected_person")
 selected_identity = st.session_state.get("selected_identity")
 selected_track = st.session_state.get("selected_track")
 
-# Build cast_options for Smart Suggestions
-cast_options = {}
-if cast_api_resp:
-    cast_members = cast_api_resp.get("cast", [])
-    cast_options = {
-        cm.get("cast_id"): cm.get("name")
-        for cm in cast_members
-        if cm.get("cast_id") and cm.get("name")
-    }
+# cast_options already comes from the bundle (run-scoped + legacy merge)
 
 if view_state == "track" and selected_track is not None:
     _render_track_view(ep_id, selected_track, identities_payload)
@@ -7155,7 +6912,7 @@ else:
         cluster_lookup,
         identity_index,
         season_label,
-        cast_api_resp=cast_api_resp,
+        bundle=bundle,
     )
 
 

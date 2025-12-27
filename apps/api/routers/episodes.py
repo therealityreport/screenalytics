@@ -31,6 +31,7 @@ from tools import episode_run
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
+from apps.api.services.faces_review_bundle import build_faces_review_bundle
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.run_export import build_run_debug_bundle_zip, build_screentime_run_debug_pdf
@@ -3396,6 +3397,28 @@ def list_cluster_tracks(
                 track["rep_thumb_url"] = media_url
     payload.setdefault("run_id", run_id_norm or "legacy")
     return payload
+
+
+@router.get("/episodes/{ep_id}/faces_review_bundle")
+def get_faces_review_bundle(
+    ep_id: str,
+    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+    filter_cast_id: str | None = Query(None, description="Optional cast_id filter for bundle output"),
+    include_archived: bool = Query(False, description="Include archived clusters/tracks in bundle"),
+) -> dict:
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        return build_faces_review_bundle(
+            ep_id,
+            run_id_norm,
+            filter_cast_id=filter_cast_id,
+            include_archived=include_archived,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
