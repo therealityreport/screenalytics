@@ -31,6 +31,7 @@ from tools import episode_run
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
+from apps.api.services import assignments as assignment_service
 from apps.api.services.faces_review_bundle import build_faces_review_bundle
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
@@ -1685,6 +1686,29 @@ class BulkTrackAssignRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200, description="Name to assign")
     show: str | None = Field(None, description="Optional show slug override")
     cast_id: str | None = Field(None, description="Optional cast_id to link assignment")
+
+
+class ClusterAssignmentRequest(BaseModel):
+    cluster_id: str = Field(..., min_length=1, description="Cluster/identity id to assign")
+    cast_id: str | None = Field(None, description="Cast member id to assign (None to clear)")
+    source: Literal["manual", "auto"] = Field("manual", description="Assignment source")
+    updated_by: str | None = Field(None, description="Optional actor identifier")
+
+
+class TrackOverrideRequest(BaseModel):
+    track_id: int = Field(..., ge=0, description="Track id to override")
+    cast_id: str | None = Field(None, description="Cast member id to assign (None to clear)")
+    source: Literal["manual", "auto"] = Field("manual", description="Assignment source")
+    updated_by: str | None = Field(None, description="Optional actor identifier")
+
+
+class FaceExclusionRequest(BaseModel):
+    face_id: str = Field(..., min_length=1, description="Face id to exclude/include")
+    excluded: bool = Field(True, description="Whether the face should be excluded")
+    reason: str | None = Field(None, description="Optional exclusion reason")
+    source: Literal["manual", "auto"] = Field("manual", description="Exclusion source")
+    updated_by: str | None = Field(None, description="Optional actor identifier")
+    track_id: int | None = Field(None, description="Optional track id context")
 
 
 class IdentityMergeRequest(BaseModel):
@@ -3419,6 +3443,143 @@ def get_faces_review_bundle(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/episodes/{ep_id}/assignments")
+def get_episode_assignments(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
+    return {
+        "ep_id": ep_id_norm,
+        "run_id": run_id_norm,
+        "assignments": {
+            "clusters": state.get("cluster_assignments_raw", {}),
+            "tracks": state.get("track_overrides", {}),
+            "faces": state.get("face_exclusions", {}),
+        },
+        "summary": state.get("summary", {}),
+    }
+
+
+@router.post("/episodes/{ep_id}/assignments/cluster")
+@router.put("/episodes/{ep_id}/assignments/cluster")
+def set_cluster_assignment(
+    ep_id: str,
+    body: ClusterAssignmentRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        assignment_service.set_cluster_assignment(
+            ep_id_norm,
+            run_id_norm,
+            cluster_id=body.cluster_id,
+            cast_id=body.cast_id,
+            source=body.source,
+            updated_by=body.updated_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
+    return {
+        "ep_id": ep_id_norm,
+        "run_id": run_id_norm,
+        "assignments": {
+            "clusters": state.get("cluster_assignments_raw", {}),
+            "tracks": state.get("track_overrides", {}),
+            "faces": state.get("face_exclusions", {}),
+        },
+        "summary": state.get("summary", {}),
+    }
+
+
+@router.post("/episodes/{ep_id}/assignments/track")
+@router.put("/episodes/{ep_id}/assignments/track")
+def set_track_assignment(
+    ep_id: str,
+    body: TrackOverrideRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        assignment_service.set_track_override(
+            ep_id_norm,
+            run_id_norm,
+            track_id=body.track_id,
+            cast_id=body.cast_id,
+            source=body.source,
+            updated_by=body.updated_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
+    return {
+        "ep_id": ep_id_norm,
+        "run_id": run_id_norm,
+        "assignments": {
+            "clusters": state.get("cluster_assignments_raw", {}),
+            "tracks": state.get("track_overrides", {}),
+            "faces": state.get("face_exclusions", {}),
+        },
+        "summary": state.get("summary", {}),
+    }
+
+
+@router.post("/episodes/{ep_id}/assignments/face_exclusion")
+@router.put("/episodes/{ep_id}/assignments/face_exclusion")
+def set_face_exclusion(
+    ep_id: str,
+    body: FaceExclusionRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        assignment_service.set_face_exclusion(
+            ep_id_norm,
+            run_id_norm,
+            face_id=body.face_id,
+            excluded=body.excluded,
+            reason=body.reason,
+            source=body.source,
+            updated_by=body.updated_by,
+            track_id=body.track_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
+    return {
+        "ep_id": ep_id_norm,
+        "run_id": run_id_norm,
+        "assignments": {
+            "clusters": state.get("cluster_assignments_raw", {}),
+            "tracks": state.get("track_overrides", {}),
+            "faces": state.get("face_exclusions", {}),
+        },
+        "summary": state.get("summary", {}),
+    }
 
 
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")

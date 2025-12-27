@@ -662,21 +662,26 @@ class GroupingService:
             "assigned_by": "user",
             "timestamp": _now_iso(),
             "cast_id": cast_id,
+            "unassigned": False,
         }
         self._save_manual_assignments(ep_id, manual_assignments)
+
+    @staticmethod
+    def _is_manual_assignment_entry(entry: Dict[str, Any]) -> bool:
+        return entry.get("assigned_by") == "user" and not entry.get("unassigned")
 
     def is_manually_assigned(self, ep_id: str, cluster_id: str) -> bool:
         """Check if a cluster was manually assigned by user."""
         manual_assignments = self._load_manual_assignments(ep_id)
         entry = manual_assignments.get(cluster_id, {})
-        return entry.get("assigned_by") == "user"
+        return self._is_manual_assignment_entry(entry)
 
     def get_manual_cluster_ids(self, ep_id: str) -> List[str]:
         """Get all cluster IDs that were manually assigned."""
         manual_assignments = self._load_manual_assignments(ep_id)
         return [
             cid for cid, data in manual_assignments.items()
-            if data.get("assigned_by") == "user"
+            if self._is_manual_assignment_entry(data)
         ]
 
     def _cluster_centroids_path(self, ep_id: str) -> Path:
@@ -1241,7 +1246,7 @@ class GroupingService:
             manual_assignments = self._load_manual_assignments(ep_id)
             manual_cluster_ids = {
                 cid for cid, data in manual_assignments.items()
-                if data.get("assigned_by") == "user"
+                if self._is_manual_assignment_entry(data)
             }
             LOGGER.info(f"[cluster_cleanup] Protecting {len(manual_cluster_ids)} manually assigned cluster(s)")
 

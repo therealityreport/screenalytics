@@ -1269,6 +1269,46 @@ def _assign_track_name(ep_id: str, track_id: int, name: str, show: str | None, c
     st.rerun()
 
 
+def _set_cluster_assignment(ep_id: str, cluster_id: str, cast_id: str | None) -> bool:
+    payload = {
+        "cluster_id": cluster_id,
+        "cast_id": cast_id,
+        "source": "manual",
+    }
+    resp = _api_post(f"/episodes/{ep_id}/assignments/cluster", payload)
+    return bool(resp)
+
+
+def _set_track_override(ep_id: str, track_id: int, cast_id: str | None) -> bool:
+    payload = {
+        "track_id": track_id,
+        "cast_id": cast_id,
+        "source": "manual",
+    }
+    resp = _api_post(f"/episodes/{ep_id}/assignments/track", payload)
+    return bool(resp)
+
+
+def _set_face_exclusion(
+    ep_id: str,
+    face_id: str,
+    *,
+    excluded: bool = True,
+    reason: str | None = None,
+    track_id: int | None = None,
+) -> bool:
+    payload = {
+        "face_id": face_id,
+        "excluded": excluded,
+        "reason": reason,
+        "source": "manual",
+    }
+    if track_id is not None:
+        payload["track_id"] = track_id
+    resp = _api_post(f"/episodes/{ep_id}/assignments/face_exclusion", payload)
+    return bool(resp)
+
+
 def _bulk_assign_tracks(
     ep_id: str, track_ids: List[int], name: str, show: str | None, cast_id: str | None = None,
     identity_id: str | None = None,
@@ -5430,6 +5470,24 @@ def _render_cluster_tracks(
     identity_meta = identity_index.get(identity_id, {})
     display_name = identity_meta.get("name")
     label = identity_meta.get("label")
+    cluster_meta = cluster_lookup.get(identity_id, {}) if isinstance(cluster_lookup, dict) else {}
+    assignment_meta = cluster_meta.get("assignment") if isinstance(cluster_meta, dict) else {}
+    assigned_cast_id = None
+    if isinstance(assignment_meta, dict):
+        assigned_cast_id = assignment_meta.get("cast_id")
+    if not assigned_cast_id:
+        assigned_cast_id = cluster_meta.get("assigned_cast_id") if isinstance(cluster_meta, dict) else None
+
+    track_assignment_lookup: Dict[int, Dict[str, Any]] = {}
+    if isinstance(cluster_meta, dict):
+        for track in cluster_meta.get("tracks", []) or []:
+            if not isinstance(track, dict):
+                continue
+            tid_val = track.get("track_id") or track.get("track") or track.get("track_int")
+            tid_int = _coerce_track_int(tid_val)
+            if tid_int is None:
+                continue
+            track_assignment_lookup[tid_int] = track.get("assignment") if isinstance(track.get("assignment"), dict) else {}
 
     tracks_count = track_reps_data.get("total_tracks", 0)
     cohesion = track_reps_data.get("cohesion")
@@ -5438,7 +5496,21 @@ def _render_cluster_tracks(
     # Header: Cluster ID
     st.subheader(f"Cluster {identity_id}")
 
-    # Show assigned person info
+    # Show assigned person info (prefer bundle assignment cast_id)
+    if isinstance(assignment_meta, dict) and assignment_meta.get("unassigned"):
+        st.caption(":orange[🚫 Cast unassigned (manual override)]")
+    elif assigned_cast_id:
+        cast_name = cast_lookup.get(assigned_cast_id, {}).get("name") if cast_lookup else None
+        st.caption(f"🎭 Assigned cast: **{cast_name or assigned_cast_id}**")
+        source_label = assignment_meta.get("source") if isinstance(assignment_meta, dict) else None
+        if source_label:
+            st.caption(f":gray[Assignment source: {source_label}]")
+        if st.button("Unassign cluster", key=f"unassign_cluster_{identity_id}", type="secondary"):
+            if _set_cluster_assignment(ep_id, identity_id, None):
+                _invalidate_assignment_caches()
+                st.success("Cluster unassigned.")
+                st.rerun()
+
     cluster_person_id = identity_meta.get("person_id")
     if display_name:
         st.caption(f"👤 Assigned to: **{display_name}**")
@@ -5716,8 +5788,12 @@ def _render_cluster_tracks(
                 # Track ID and similarity badge
                 excluded_frames = track_rep.get("excluded_frames", 0)
                 badge_html = render_track_with_dropout(similarity, excluded_frames, frame_count)
+                override_badge = ""
+                assignment_meta = track_assignment_lookup.get(track_id_int or -1, {})
+                if isinstance(assignment_meta, dict) and assignment_meta.get("assignment_type") == "track_override":
+                    override_badge = " · ⚡ Override"
                 st.markdown(
-                    f"**Track {track_num}** {badge_html} · {frame_count} frames",
+                    f"**Track {track_num}** {badge_html}{override_badge} · {frame_count} frames",
                     unsafe_allow_html=True
                 )
 
@@ -5884,7 +5960,14 @@ def _render_cluster_tracks(
                             st.error("Failed to export seeds. Check logs for details.")
 
 
-def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, Any]) -> None:
+def _render_track_view(
+    ep_id: str,
+    track_id: int,
+    identities_payload: Dict[str, Any],
+    cluster_lookup: Dict[str, Dict[str, Any]] | None = None,
+    cast_options: Dict[str, str] | None = None,
+    face_exclusions: Dict[str, Any] | None = None,
+) -> None:
     _render_view_header("track")
     st.button(
         "← Back to tracks",
@@ -5899,28 +5982,83 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     identities = identities_payload.get("identities", [])
     identity_lookup = {identity.get("identity_id"): identity for identity in identities}
     current_identity = st.session_state.get("selected_identity")
+    cluster_lookup = cluster_lookup or {}
+    face_exclusions = face_exclusions or {}
 
     # Show assigned person/cluster info
     show_slug = _episode_show_slug(ep_id)
     if current_identity:
         identity_data = identity_lookup.get(current_identity, {})
-        assigned_name = identity_data.get("name")
-        person_id = identity_data.get("person_id")
-        if assigned_name:
-            st.caption(f"👤 Assigned to: **{assigned_name}**")
-        elif person_id:
-            # Look up person's name from registry
-            people_payload = _fetch_people_cached(show_slug) if show_slug else None
-            people = people_payload.get("people", []) if people_payload else []
-            people_lookup = {p.get("person_id"): p for p in people if p.get("person_id")}
-            person_record = people_lookup.get(person_id, {})
-            person_name = person_record.get("name")
-            if person_name:
-                st.caption(f"👤 Assigned to: **{person_name}**")
-            else:
-                st.caption(f"👤 Assigned to: `{person_id}`")
+        cluster_meta = cluster_lookup.get(current_identity, {}) if isinstance(cluster_lookup, dict) else {}
+        assignment_meta = cluster_meta.get("assignment") if isinstance(cluster_meta, dict) else {}
+        assigned_cast_id = assignment_meta.get("cast_id") if isinstance(assignment_meta, dict) else None
+        if not assigned_cast_id and isinstance(cluster_meta, dict):
+            assigned_cast_id = cluster_meta.get("assigned_cast_id")
+        track_assignment_meta: Dict[str, Any] = {}
+        if isinstance(cluster_meta, dict):
+            for track in cluster_meta.get("tracks", []) or []:
+                if not isinstance(track, dict):
+                    continue
+                tid_val = track.get("track_id") or track.get("track") or track.get("track_int")
+                if _coerce_track_int(tid_val) == track_id:
+                    track_assignment_meta = track.get("assignment") if isinstance(track.get("assignment"), dict) else {}
+                    break
+
+        if isinstance(assignment_meta, dict) and assignment_meta.get("unassigned"):
+            st.caption(":orange[🚫 Cast unassigned (manual override)]")
+        elif assigned_cast_id:
+            cast_name = cast_options.get(assigned_cast_id) if cast_options else None
+            st.caption(f"🎭 Assigned cast: **{cast_name or assigned_cast_id}**")
+            if track_assignment_meta.get("assignment_type") == "track_override":
+                st.caption(":orange[⚡ Track override active]")
         else:
-            st.caption(f"📦 Cluster: `{current_identity}`")
+            assigned_name = identity_data.get("name")
+            person_id = identity_data.get("person_id")
+            if assigned_name:
+                st.caption(f"👤 Assigned to: **{assigned_name}**")
+            elif person_id:
+                # Look up person's name from registry
+                people_payload = _fetch_people_cached(show_slug) if show_slug else None
+                people = people_payload.get("people", []) if people_payload else []
+                people_lookup = {p.get("person_id"): p for p in people if p.get("person_id")}
+                person_record = people_lookup.get(person_id, {})
+                person_name = person_record.get("name")
+                if person_name:
+                    st.caption(f"👤 Assigned to: **{person_name}**")
+                else:
+                    st.caption(f"👤 Assigned to: `{person_id}`")
+            else:
+                st.caption(f"📦 Cluster: `{current_identity}`")
+
+        if cast_options and track_id is not None:
+            override_key = f"track_override_{current_identity}_{track_id}"
+            with st.popover("Override cast for this track"):
+                selected_cast_id = st.selectbox(
+                    "Select cast member",
+                    options=[""] + list(cast_options.keys()),
+                    format_func=lambda cid: cast_options.get(cid, "Select...") if cid else "Select cast member...",
+                    key=override_key,
+                    label_visibility="collapsed",
+                )
+                if selected_cast_id and st.button(
+                    "Apply override",
+                    key=f"{override_key}_apply",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    if _set_track_override(ep_id, track_id, selected_cast_id):
+                        _invalidate_assignment_caches()
+                        st.success("Track override saved.")
+                        st.rerun()
+                if track_assignment_meta.get("assignment_type") == "track_override" and st.button(
+                    "Clear override",
+                    key=f"{override_key}_clear",
+                    use_container_width=True,
+                ):
+                    if _set_track_override(ep_id, track_id, None):
+                        _invalidate_assignment_caches()
+                        st.success("Track override cleared.")
+                        st.rerun()
 
     # Track metrics strip (Nov 2024)
     track_metrics = _fetch_track_metrics_cached(ep_id, track_id)
@@ -6343,6 +6481,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     selection_store: Dict[int, set[int]] = st.session_state.setdefault("track_frame_selection", {})
     track_selection = selection_store.setdefault(track_id, set())
     selected_frames: List[int] = []
+    frame_face_ids: Dict[int, str] = {}
     if frames:
         st.caption("Select frames to move or delete.")
         cols_per_row = 6
@@ -6392,6 +6531,8 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     frame_idx_int = int(frame_idx)
                 except (TypeError, ValueError):
                     frame_idx_int = None
+                if frame_idx_int is not None and face_id:
+                    frame_face_ids[frame_idx_int] = str(face_id)
 
                 # Get thumbnail URL from the specific face, NOT from frame-level data
                 # Face-level URLs ensure we always show the correct person for this track
@@ -6454,6 +6595,9 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                             st.markdown(outlier_badge, unsafe_allow_html=True)
                     if skip_reason:
                         st.markdown(f":red[⚠ invalid crop] {skip_reason}")
+                    exclusion_entry = face_exclusions.get(str(face_id)) if face_id else None
+                    if isinstance(exclusion_entry, dict) and exclusion_entry.get("excluded", True):
+                        st.markdown(":orange[🚫 Excluded]")
                     if frame_idx_int is None:
                         continue
                     key = f"face_select_{track_id}_{frame_idx_int}"
@@ -6512,7 +6656,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             text_label="New roster name",
         )
         move_disabled = not (target_identity_id or target_name)
-        action_cols = st.columns([1, 1])
+        action_cols = st.columns([1, 1, 1])
         if action_cols[0].button(
             "Move selected",
             key=f"track_move_selected_{track_id}",
@@ -6528,6 +6672,20 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             )
         if action_cols[1].button("Delete selected", key=f"track_delete_selected_{track_id}", type="secondary"):
             _delete_frames_api(ep_id, track_id, selected_frames)
+        selected_face_ids = [
+            frame_face_ids[frame_idx]
+            for frame_idx in selected_frames
+            if frame_idx in frame_face_ids
+        ]
+        if action_cols[2].button("Exclude selected", key=f"track_exclude_selected_{track_id}"):
+            if not selected_face_ids:
+                st.warning("No face ids available for selected frames.")
+            else:
+                for face_id in selected_face_ids:
+                    _set_face_exclusion(ep_id, face_id, excluded=True, track_id=track_id)
+                _invalidate_assignment_caches()
+                st.success(f"Excluded {len(selected_face_ids)} face(s).")
+                st.rerun()
 
 
 def _track_identity_edit(ep_id: str, identity_id: str) -> None:
@@ -6871,9 +7029,18 @@ selected_identity = st.session_state.get("selected_identity")
 selected_track = st.session_state.get("selected_track")
 
 # cast_options already comes from the bundle (run-scoped + legacy merge)
+assignment_payload = bundle.get("assignments") or {}
+face_exclusions = assignment_payload.get("faces") or {}
 
 if view_state == "track" and selected_track is not None:
-    _render_track_view(ep_id, selected_track, identities_payload)
+    _render_track_view(
+        ep_id,
+        selected_track,
+        identities_payload,
+        cluster_lookup=cluster_lookup,
+        cast_options=cast_options,
+        face_exclusions=face_exclusions,
+    )
 elif view_state == "cluster_tracks" and selected_identity:
     _render_cluster_tracks(
         ep_id,

@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from py_screenalytics import run_layout
 
+from apps.api.services.assignments import load_assignment_state
+from apps.api.services.assignment_resolver import resolve_cluster_assignment, resolve_track_assignment
 from apps.api.services.archive import ArchiveService
 from apps.api.services.cast import CastService
 from apps.api.services.grouping import GroupingService
@@ -281,6 +283,31 @@ def build_faces_review_bundle(
     cluster_payload["clusters"] = filtered_clusters
     cluster_lookup = _build_cluster_lookup(filtered_clusters)
 
+    assignment_state = load_assignment_state(
+        ep_id,
+        run_id_norm,
+        data_root=data_root,
+        include_inferred=True,
+    )
+    cluster_assignments = assignment_state.get("cluster_assignments", {})
+    track_overrides = assignment_state.get("track_overrides", {})
+
+    for cluster in filtered_clusters:
+        cluster_id = cluster.get("identity_id") or cluster.get("cluster_id")
+        cluster_assignment = resolve_cluster_assignment(cluster_id, cluster_assignments)
+        cluster["assigned_cast_id"] = cluster_assignment.get("cast_id")
+        cluster["assignment"] = cluster_assignment
+        for track in cluster.get("tracks", []) or []:
+            track_id = track.get("track_id") or track.get("track") or track.get("track_int")
+            track_assignment = resolve_track_assignment(
+                track_id,
+                str(cluster_id) if cluster_id else None,
+                cluster_assignments,
+                track_overrides,
+            )
+            track["effective_cast_id"] = track_assignment.get("cast_id")
+            track["assignment"] = track_assignment
+
     try:
         unlinked = grouping_service.list_unlinked_entities(ep_id)
         unlinked_entities = unlinked.get("entities", []) if unlinked else []
@@ -389,6 +416,12 @@ def build_faces_review_bundle(
         "people": people,
         "unlinked_entities": unlinked_entities,
         "archived_ids": archived_ids,
+        "assignments": {
+            "clusters": assignment_state.get("cluster_assignments_raw", cluster_assignments),
+            "tracks": assignment_state.get("track_overrides", {}),
+            "faces": assignment_state.get("face_exclusions", {}),
+            "summary": assignment_state.get("summary", {}),
+        },
         "cluster_payload": cluster_payload,
         "identities": identities_payload,
     }
