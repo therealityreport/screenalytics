@@ -50,6 +50,7 @@ def test_invalid_profile_rejected() -> None:
     with pytest.raises(ValidationError) as exc_info:
         DetectTrackRequest(
             ep_id="test",
+            run_id="test-run",
             profile="invalid_profile_name",
         )
 
@@ -67,6 +68,7 @@ def test_profile_resolution_explicit_override() -> None:
     # Create request with profile AND explicit stride
     request = DetectTrackRequest(
         ep_id="test",
+        run_id="test-run",
         profile="balanced",
         stride=12,  # Explicit override
     )
@@ -89,6 +91,7 @@ def test_env_var_not_override_explicit_param(monkeypatch: pytest.MonkeyPatch) ->
     # Explicit parameter should win
     request = DetectTrackRequest(
         ep_id="test",
+        run_id="test-run",
         stride=6,
     )
 
@@ -105,6 +108,7 @@ def test_profile_field_optional() -> None:
     # Profile can be omitted
     request = DetectTrackRequest(
         ep_id="test",
+        run_id="test-run",
     )
 
     assert request.profile is None, "Profile should default to None"
@@ -235,6 +239,7 @@ def test_profile_passthrough_to_cli() -> None:
     # Create request with profile
     request = DetectTrackRequest(
         ep_id="test",
+        run_id="test-run",
         profile="balanced",
         stride=6,
         device="cpu",
@@ -265,6 +270,7 @@ def test_profile_none_does_not_add_flag() -> None:
     # Create request without profile
     request = DetectTrackRequest(
         ep_id="test",
+        run_id="test-run",
         profile=None,
         device="cpu",
     )
@@ -286,7 +292,12 @@ def test_low_power_profile_applies_defaults() -> None:
 
     from apps.api.routers.jobs import DetectTrackRequest, _resolve_detect_track_inputs
 
-    request = DetectTrackRequest(ep_id="test-low-power", profile="low_power", device="mps")
+    request = DetectTrackRequest(
+        ep_id="test-low-power",
+        run_id="test-run",
+        profile="low_power",
+        device="mps",
+    )
     effective = _resolve_detect_track_inputs(request, resolved_device="mps")
 
     assert effective["profile"] == "low_power"
@@ -305,11 +316,17 @@ def test_default_profile_for_mps_prefers_low_power() -> None:
     from apps.api.routers.jobs import DetectTrackRequest, _resolve_detect_track_inputs
 
     # Omit profile to trigger device-based defaulting
-    request = DetectTrackRequest(ep_id="test-default-profile", device="mps")
+    request = DetectTrackRequest(
+        ep_id="test-default-profile",
+        run_id="test-run",
+        device="mps",
+    )
     effective = _resolve_detect_track_inputs(request, resolved_device="mps")
 
     assert effective["profile"] == "low_power"
     assert effective["stride"] == 8
+
+
 def test_device_literal_values() -> None:
     """Test that DEVICE_LITERAL includes all expected device types."""
     import sys
