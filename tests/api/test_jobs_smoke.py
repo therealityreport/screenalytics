@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from apps.api.main import app
 from apps.api.routers import jobs as jobs_router
 from apps.api.services.jobs import JobService
+from py_screenalytics import run_layout
 
 RUN_ML_TESTS = os.environ.get("RUN_ML_TESTS") == "1"
 pytestmark = pytest.mark.skipif(
@@ -165,13 +166,16 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     shutil.copy(video_path, video_dest)
 
     ep_id = "api-smoke-test"
-    manifest_root = data_root / "manifests" / ep_id
+    run_id = "run-smoke-1"
+    manifest_root = run_layout.run_root(ep_id, run_id)
+    embed_root = data_root / "embeds" / ep_id / "runs" / run_id
 
     with _api_client(data_root) as client:
         # Step 1: Submit detect_track job
         print("\n=== Step 1: Submitting detect_track job ===")
         detect_request = {
             "ep_id": ep_id,
+            "run_id": run_id,
             "profile": "balanced",
             "stride": 6,
             "device": "cpu",
@@ -183,7 +187,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         detect_job_id = detect_response["job_id"]
 
         print(f"  Job ID: {detect_job_id}")
-        assert detect_response["state"] == "running"
+        assert detect_response["state"] == "queued"
 
         # Poll until detect_track completes
         print("  Polling for completion...")
@@ -221,6 +225,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         print("\n=== Step 2: Submitting faces_embed job ===")
         faces_request = {
             "ep_id": ep_id,
+            "run_id": run_id,
             "profile": "balanced",
             "device": "cpu",
             "save_frames": False,
@@ -231,7 +236,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         faces_job_id = faces_response["job_id"]
 
         print(f"  Job ID: {faces_job_id}")
-        assert faces_response["state"] == "running"
+        assert faces_response["state"] == "queued"
 
         # Poll until faces_embed completes
         print("  Polling for completion...")
@@ -244,12 +249,13 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Verify artifacts exist
         assert (manifest_root / "faces.jsonl").exists(), "faces.jsonl not created"
-        assert (manifest_root / "faces.npy").exists(), "faces.npy not created"
+        assert (embed_root / "faces.npy").exists(), "faces.npy not created"
 
         # Step 3: Submit cluster job
         print("\n=== Step 3: Submitting cluster job ===")
         cluster_request = {
             "ep_id": ep_id,
+            "run_id": run_id,
             "profile": "balanced",
             "device": "cpu",
             "cluster_thresh": 0.58,
@@ -261,7 +267,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         cluster_job_id = cluster_response["job_id"]
 
         print(f"  Job ID: {cluster_job_id}")
-        assert cluster_response["state"] == "running"
+        assert cluster_response["state"] == "queued"
 
         # Poll until cluster completes
         print("  Polling for completion...")

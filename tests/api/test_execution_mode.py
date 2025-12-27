@@ -14,8 +14,9 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 from fastapi.testclient import TestClient
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
+
+
 
 
 @pytest.fixture
@@ -56,19 +57,25 @@ class TestExecutionModeParameter:
         """POST /celery_jobs/detect_track accepts execution_mode='redis'."""
         captured: dict = {}
 
-        def fake_delay(ep_id, options):
+        def _fake_enqueue(*, ep_id: str, run_id: str, stage: str, params: dict | None, source: str = "test") -> dict:
             captured["ep_id"] = ep_id
-            captured["options"] = options
-            return SimpleNamespace(id="job-redis-123")
+            captured["run_id"] = run_id
+            captured["stage"] = stage
+            captured["params"] = params
+            return {
+                "status": "queued",
+                "ep_id": ep_id,
+                "run_id": run_id,
+                "stage": stage,
+                "job_id": "job-redis-123",
+                "params_hash": "hash",
+            }
 
-        monkeypatch.setattr(
-            "apps.api.routers.celery_jobs.run_detect_track_task",
-            SimpleNamespace(delay=fake_delay),
-        )
-        monkeypatch.setattr("apps.api.routers.celery_jobs.check_active_job", lambda ep_id, op: None)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._enqueue_run_stage_job", _fake_enqueue)
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-redis-1",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "redis",
@@ -103,6 +110,7 @@ class TestExecutionModeParameter:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-1",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",
@@ -137,6 +145,7 @@ class TestExecutionModeParameter:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-2",
             "device": "cpu",
             "execution_mode": "local",
         }
@@ -165,6 +174,7 @@ class TestExecutionModeParameter:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-3",
             "device": "cpu",
             "cluster_thresh": 0.7,
             "min_cluster_size": 2,
@@ -195,6 +205,7 @@ class TestExecutionModeParameter:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-4",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",
@@ -214,18 +225,22 @@ class TestExecutionModeParameter:
         """Execution mode should default to 'redis' when not specified."""
         captured: dict = {}
 
-        def fake_delay(ep_id, options):
+        def _fake_enqueue(*, ep_id: str, run_id: str, stage: str, params: dict | None, source: str = "test") -> dict:
             captured["called"] = True
-            return SimpleNamespace(id="job-default-123")
+            return {
+                "status": "queued",
+                "ep_id": ep_id,
+                "run_id": run_id,
+                "stage": stage,
+                "job_id": "job-default-123",
+                "params_hash": "hash",
+            }
 
-        monkeypatch.setattr(
-            "apps.api.routers.celery_jobs.run_detect_track_task",
-            SimpleNamespace(delay=fake_delay),
-        )
-        monkeypatch.setattr("apps.api.routers.celery_jobs.check_active_job", lambda ep_id, op: None)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._enqueue_run_stage_job", _fake_enqueue)
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-redis-default",
             "stride": 6,
             "device": "cpu",
             # No execution_mode specified - should default to redis
@@ -417,6 +432,7 @@ class TestLocalModeThermalSafety:
         # Request 8 threads - should be capped at 2
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-cpu-cap",
             "stride": 6,
             "device": "cpu",
             "cpu_threads": 8,  # Request more threads
@@ -449,6 +465,7 @@ class TestLocalModeThermalSafety:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-process-group",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",
@@ -487,6 +504,7 @@ class TestLocalModeAlreadyRunning:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-dup",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",
@@ -520,6 +538,7 @@ class TestLocalModeResponseStructure:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-profile",
             "stride": 6,
             "device": "coreml",
             "execution_mode": "local",
@@ -549,6 +568,7 @@ class TestLocalModeResponseStructure:
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-local-logs",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",

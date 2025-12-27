@@ -5,13 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from py_screenalytics import run_layout
-from py_screenalytics.artifacts import get_path
+from apps.api.services.storage import StorageService
 
 from apps.api.services.run_persistence import run_persistence_service
 
@@ -69,83 +67,72 @@ def _ensure_stage_defaults(stages: Dict[str, Any]) -> Dict[str, Any]:
     return stages
 
 
-def _artifact_entry(path: Path, *, s3_key: str | None = None) -> Dict[str, Any]:
-    entry = {"path": str(path), "exists": path.exists()}
+_STORAGE = StorageService()
+
+
+def _artifact_entry(*, s3_key: str | None) -> Dict[str, Any]:
+    entry = {"s3_key": s3_key, "exists": False}
     if s3_key:
-        entry["s3_key"] = s3_key
+        entry["exists"] = _STORAGE.object_exists(s3_key)
     return entry
 
 
 def _build_artifact_pointers(ep_id: str, run_id: str) -> Dict[str, Any]:
     run_id_norm = run_layout.normalize_run_id(run_id)
-    run_root = run_layout.run_root(ep_id, run_id_norm)
-    frames_root = get_path(ep_id, "frames_root")
-    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-    embeds_root = data_root / "embeds" / ep_id / "runs" / run_id_norm
-
-    exports_root = run_root / "exports"
-    analytics_root = run_root / "analytics"
-
-    faces_path = run_root / "faces.jsonl"
-    tracks_path = run_root / "tracks.jsonl"
-    track_reps_path = run_root / "track_reps.jsonl"
-    faces_manifest_exists = faces_path.exists()
+    faces_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl")
+    tracks_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "tracks.jsonl")
+    track_reps_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "track_reps.jsonl")
+    identities_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "identities.json")
+    embeddings_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.npy")
+    faces_manifest_exists = _STORAGE.object_exists(faces_key)
+    track_reps_exists = _STORAGE.object_exists(track_reps_key)
+    embeddings_exists = _STORAGE.object_exists(embeddings_key)
+    tracks_exists = _STORAGE.object_exists(tracks_key)
     faces_source: str | None = None
     if faces_manifest_exists:
         faces_source = "manifest"
-    elif (embeds_root / "faces.npy").exists() or track_reps_path.exists():
+    elif embeddings_exists or track_reps_exists:
         faces_source = "embeddings"
-    elif tracks_path.exists():
+    elif tracks_exists:
         faces_source = "tracks"
 
     faces_entry = _artifact_entry(
-        faces_path,
-        s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl"),
+        s3_key=faces_key,
     )
-    faces_entry["manifest_path"] = str(faces_path)
-    faces_entry["manifest_key"] = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl")
+    faces_entry["manifest_key"] = faces_key
     faces_entry["manifest_exists"] = faces_manifest_exists
     faces_entry["source"] = faces_source
 
     return {
-        "run_root": str(run_root),
+        "run_prefix": run_layout.run_s3_prefix(ep_id, run_id_norm),
         "tracks": _artifact_entry(
-            tracks_path,
-            s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "tracks.jsonl"),
+            s3_key=tracks_key,
         ),
         "faces": faces_entry,
         "identities": _artifact_entry(
-            run_root / "identities.json",
-            s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "identities.json"),
+            s3_key=identities_key,
         ),
         "track_reps": _artifact_entry(
-            track_reps_path,
-            s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "track_reps.jsonl"),
+            s3_key=track_reps_key,
         ),
         "crops": {
-            "run_prefix": str(frames_root / "runs" / run_id_norm / "crops"),
-            "run_exists": (frames_root / "runs" / run_id_norm / "crops").exists(),
-            "legacy_prefix": str(frames_root / "crops"),
-            "legacy_exists": (frames_root / "crops").exists(),
+            "s3_prefix": f"{run_layout.run_s3_prefix(ep_id, run_id_norm)}crops/",
+            "s3_layout": run_layout.get_run_s3_layout(ep_id, run_id_norm).s3_layout,
         },
         "embeddings": _artifact_entry(
-            embeds_root / "faces.npy",
+            s3_key=embeddings_key,
         ),
         "exports": {
             "screentime_csv": _artifact_entry(
-                analytics_root / "screentime.csv",
                 s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "analytics/screentime.csv"),
             ),
             "screentime_json": _artifact_entry(
-                analytics_root / "screentime.json",
                 s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "analytics/screentime.json"),
             ),
             "run_debug_pdf": _artifact_entry(
-                exports_root / "run_debug.pdf",
                 s3_key=run_layout.run_export_s3_key(ep_id, run_id_norm, "run_debug.pdf"),
             ),
             "debug_bundle_zip": _artifact_entry(
-                exports_root / "debug_bundle.zip",
                 s3_key=run_layout.run_export_s3_key(ep_id, run_id_norm, "debug_bundle.zip"),
             ),
         },

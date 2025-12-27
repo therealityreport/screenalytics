@@ -281,7 +281,7 @@ class StorageService:
             boto3_mod = _boto3()
             if boto3_mod is None:
                 self._fallback_to_local(
-                    "boto3 unavailable for STORAGE_BACKEND=s3; install boto3 or set STORAGE_BACKEND=local"
+                    "boto3 unavailable for STORAGE_BACKEND=s3; install boto3 or configure MinIO/S3"
                 )
             else:
                 from botocore.exceptions import ClientError  # type: ignore
@@ -299,7 +299,7 @@ class StorageService:
             boto3_mod = _boto3()
             if boto3_mod is None:
                 self._fallback_to_local(
-                    "boto3 unavailable for STORAGE_BACKEND=minio; install boto3 or set STORAGE_BACKEND=local"
+                    "boto3 unavailable for STORAGE_BACKEND=minio; install boto3 or configure MinIO/S3"
                 )
             else:
                 from botocore.client import Config  # type: ignore
@@ -322,6 +322,7 @@ class StorageService:
                 self._client_error_cls = ClientError
         elif self.backend == "local":
             self.bucket = "local"
+            self.init_error = "Local storage backend is disabled; use STORAGE_BACKEND=s3 or STORAGE_BACKEND=minio."
         else:
             raise ValueError(f"Unsupported STORAGE_BACKEND '{self.backend}'")
 
@@ -333,16 +334,12 @@ class StorageService:
         self._init_facebank_storage()
 
     def _fallback_to_local(self, reason: str) -> None:
-        """Downgrade to local storage when optional deps are missing."""
+        """Record a storage init error without falling back to local."""
 
         if self._backend_fallback_applied:
             return
         self.init_error = reason
         LOGGER.warning("[storage] %s", reason)
-        self.backend = "local"
-        self.bucket = "local"
-        self._client = None
-        self._client_error_cls = None
         self._backend_fallback_applied = True
 
     def _init_facebank_storage(self) -> None:
@@ -462,9 +459,9 @@ class StorageService:
         headers = {"Content-Type": content_type}
 
         if self.backend == "local":
-            upload_url = f"{LOCAL_UPLOAD_BASE}/{object_key}"
-            method = "FILE"
-            path = object_key
+            raise RuntimeError(
+                "Local storage backend is disabled; use STORAGE_BACKEND=s3 or STORAGE_BACKEND=minio."
+            )
         else:
             assert self._client is not None  # for mypy
             params = {
@@ -909,6 +906,8 @@ class StorageService:
         sample: int = 1,
         max_keys: int = 500,
         start_after: str | None = None,
+        crops_roots: Iterable[Path] | None = None,
+        crops_prefix: str | None = None,
     ) -> Dict[str, Any]:
         sample = max(1, int(sample or 1))
         max_keys = max(1, min(int(max_keys or 1), 1000))
@@ -924,6 +923,7 @@ class StorageService:
                 max_keys,
                 normalized_cursor,
                 cursor_cycle,
+                crops_prefix=crops_prefix,
             )
         return self._list_local_track_crops(
             ep_ctx.ep_id,
@@ -932,6 +932,7 @@ class StorageService:
             max_keys,
             normalized_cursor,
             cursor_cycle,
+            crops_roots=crops_roots,
         )
 
     def _list_local_track_crops(
@@ -942,13 +943,19 @@ class StorageService:
         max_keys: int,
         cursor_key: str | None,
         cursor_cycle: int,
+        crops_roots: Iterable[Path] | None = None,
     ) -> Dict[str, Any]:
         crops_root = get_path(ep_id, "frames_root") / "crops"
-        candidate_roots: List[Path] = [crops_root]
-        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-        legacy_root = fallback_root / ep_id / "tracks"
-        if legacy_root not in candidate_roots:
-            candidate_roots.append(legacy_root)
+        candidate_roots: List[Path] = []
+        if crops_roots:
+            for root in crops_roots:
+                if not root:
+                    continue
+                root_path = Path(root)
+                if root_path not in candidate_roots:
+                    candidate_roots.append(root_path)
+        if not candidate_roots:
+            candidate_roots.append(crops_root)
         base_root: Path | None = None
         entries: List[Dict[str, Any]] = []
         for root in candidate_roots:
@@ -992,9 +999,10 @@ class StorageService:
         max_keys: int,
         cursor_key: str | None,
         cursor_cycle: int,
+        crops_prefix: str | None = None,
     ) -> Dict[str, Any]:
         prefixes = artifact_prefixes(ep_ctx)
-        crops_prefix = prefixes.get("crops")
+        crops_prefix = crops_prefix or prefixes.get("crops")
         if not crops_prefix:
             return {"items": [], "next_start_after": None}
         base_prefix = crops_prefix.rstrip("/") + "/"

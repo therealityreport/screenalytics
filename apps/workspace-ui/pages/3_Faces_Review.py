@@ -669,8 +669,9 @@ def _improve_faces_state_key(ep_id: str, suffix: str) -> str:
 
 
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
-def _fetch_identities_cached(ep_id: str) -> Dict[str, Any] | None:
-    return _safe_api_get(f"/episodes/{ep_id}/identities")
+def _fetch_identities_cached(ep_id: str, run_id: str | None) -> Dict[str, Any] | None:
+    params = {"run_id": run_id} if run_id else None
+    return _safe_api_get(f"/episodes/{ep_id}/identities", params=params)
 
 
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
@@ -1216,13 +1217,13 @@ def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, A
                         st.error("Failed to start job. See API logs.")
 
     faces_source = faces_artifacts.get("source") or "unknown"
-    faces_manifest_path = faces_artifacts.get("manifest_path") or faces_artifacts.get("path")
+    faces_manifest_key = faces_artifacts.get("manifest_key") or faces_artifacts.get("s3_key")
     faces_manifest_exists = faces_artifacts.get("manifest_exists")
     if faces_manifest_exists is None:
         faces_manifest_exists = faces_artifacts.get("exists")
-    if faces_manifest_path:
+    if faces_manifest_key:
         st.caption(
-            f"Faces source: {faces_source} · manifest: {faces_manifest_path} "
+            f"Faces source: {faces_source} · manifest: {faces_manifest_key} "
             f"({'present' if faces_manifest_exists else 'missing'})"
         )
 
@@ -5020,7 +5021,7 @@ def _render_person_clusters(
 
     # Pre-fetch identities data for potential person-level similarity scoring
     # (actual computation happens during frame rendering if needed)
-    _fetch_identities_cached(ep_id)
+    _fetch_identities_cached(ep_id, _CURRENT_RUN_ID)
 
     st.caption(f"{len(episode_clusters)} clusters · {total_tracks} tracks · {total_faces} frames")
 

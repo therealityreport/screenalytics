@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yaml
+from py_screenalytics import run_layout
 
 PAGE_PATH = Path(__file__).resolve()
 WORKSPACE_DIR = PAGE_PATH.parents[1]
@@ -82,9 +83,15 @@ def load_pipeline_configs() -> Dict[str, Any]:
     return configs
 
 
-def _load_scene_cuts(ep_id: str) -> dict | None:
+def _manifest_path(ep_id: str, run_id: str | None, filename: str) -> Path:
+    if run_id:
+        return run_layout.run_root(ep_id, run_id) / filename
+    return helpers.DATA_ROOT / "manifests" / ep_id / filename
+
+
+def _load_scene_cuts(ep_id: str, run_id: str | None) -> dict | None:
     """Load scene cuts from track_metrics.json."""
-    metrics_path = helpers.DATA_ROOT / "manifests" / ep_id / "track_metrics.json"
+    metrics_path = _manifest_path(ep_id, run_id, "track_metrics.json")
     if metrics_path.exists():
         try:
             data = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -143,9 +150,9 @@ def _compute_overlap_regions(timeline_data: list) -> list[tuple[float, float, in
     return regions
 
 
-def _load_tracks(ep_id: str) -> list[dict]:
+def _load_tracks(ep_id: str, run_id: str | None) -> list[dict]:
     """Load track data from tracks.jsonl."""
-    tracks_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+    tracks_path = _manifest_path(ep_id, run_id, "tracks.jsonl")
     if not tracks_path.exists():
         return []
     tracks = []
@@ -158,9 +165,9 @@ def _load_tracks(ep_id: str) -> list[dict]:
     return tracks
 
 
-def _load_identities(ep_id: str) -> dict:
+def _load_identities(ep_id: str, run_id: str | None) -> dict:
     """Load cluster/identity data from identities.json."""
-    identities_path = helpers.DATA_ROOT / "manifests" / ep_id / "identities.json"
+    identities_path = _manifest_path(ep_id, run_id, "identities.json")
     if not identities_path.exists():
         return {"identities": []}
     try:
@@ -169,9 +176,9 @@ def _load_identities(ep_id: str) -> dict:
         return {"identities": []}
 
 
-def _load_skipped_faces(ep_id: str) -> list[dict]:
+def _load_skipped_faces(ep_id: str, run_id: str | None) -> list[dict]:
     """Load faces that were skipped due to quality issues."""
-    faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
+    faces_path = _manifest_path(ep_id, run_id, "faces.jsonl")
     if not faces_path.exists():
         return []
     skipped = []
@@ -237,13 +244,23 @@ def _compute_no_face_regions(
     return gaps
 
 
-def _get_export_job_info(ep_id: str, job_id_hint: str | None = None) -> dict | None:
+def _get_export_job_info(
+    ep_id: str,
+    *,
+    run_id: str | None = None,
+    job_id_hint: str | None = None,
+) -> dict | None:
     """Return the most relevant overlay export job (succeeded > running > hinted)."""
     try:
         jobs_resp = helpers.api_get(f"/jobs?ep_id={ep_id}&job_type=video_export")
         jobs = jobs_resp.get("jobs", [])
     except requests.RequestException:
         jobs = []
+
+    if run_id:
+        scoped = [job for job in jobs if (job.get("requested") or {}).get("run_id") == run_id]
+        if scoped:
+            jobs = scoped
 
     job_lookup = {j.get("job_id"): j for j in jobs}
     selected = job_lookup.get(job_id_hint) if job_id_hint else None
@@ -276,12 +293,12 @@ def _get_export_job_info(ep_id: str, job_id_hint: str | None = None) -> dict | N
     }
 
 
-def _ensure_export_job(ep_id: str, include_unidentified: bool = True) -> dict | None:
+def _ensure_export_job(ep_id: str, *, run_id: str | None, include_unidentified: bool = True) -> dict | None:
     """Fetch existing overlay export job or start a new one after screentime completes."""
-    export_job_key = f"{ep_id}::overlay_export_job"
+    export_job_key = f"{ep_id}::{run_id or 'legacy'}::overlay_export_job"
     job_hint = st.session_state.get(export_job_key)
 
-    export_info = _get_export_job_info(ep_id, job_hint)
+    export_info = _get_export_job_info(ep_id, run_id=run_id, job_id_hint=job_hint)
     if export_info:
         st.session_state[export_job_key] = export_info["job_id"]
         return export_info
@@ -344,18 +361,88 @@ def _require_episode() -> str:
     _stop_forever()
 
 
+def _resolve_run_id(ep_id: str) -> str | None:
+    resolved_run_id: str | None = None
+    qp_candidate = None
+    try:
+        qp_value = st.query_params.get("run_id")
+    except Exception:
+        qp_value = None
+    if isinstance(qp_value, str):
+        qp_candidate = qp_value.strip()
+    elif isinstance(qp_value, list) and qp_value:
+        qp_candidate = str(qp_value[0]).strip()
+    if qp_candidate:
+        try:
+            normalized_qp_run_id = run_layout.normalize_run_id(qp_candidate)
+        except ValueError:
+            normalized_qp_run_id = None
+        if normalized_qp_run_id:
+            try:
+                known_run_ids = run_layout.list_run_ids(ep_id)
+            except Exception:
+                known_run_ids = []
+            try:
+                active_run_id = run_layout.read_active_run_id(ep_id)
+            except Exception:
+                active_run_id = None
+            if not known_run_ids or normalized_qp_run_id in known_run_ids or normalized_qp_run_id == active_run_id:
+                resolved_run_id = normalized_qp_run_id
+
+    if not resolved_run_id:
+        try:
+            resolved_run_id = run_layout.read_active_run_id(ep_id)
+        except Exception:
+            resolved_run_id = None
+
+    if not resolved_run_id:
+        try:
+            candidate_run_ids = run_layout.list_run_ids(ep_id)
+        except Exception:
+            candidate_run_ids = []
+        latest_run_id: str | None = None
+        latest_mtime = -1.0
+        for candidate in candidate_run_ids:
+            try:
+                run_root = run_layout.run_root(ep_id, candidate)
+            except Exception:
+                continue
+            try:
+                mtime = run_root.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_run_id = candidate
+        resolved_run_id = latest_run_id
+    return resolved_run_id
+
+
 ep_id = _require_episode()
 helpers.set_ep_id(ep_id)
 
-analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
-json_path = analytics_dir / "screentime.json"
-csv_path = analytics_dir / "screentime.csv"
+run_id = _resolve_run_id(ep_id)
+if not run_id:
+    st.warning("Screen Time Analysis requires a run-scoped attempt (run_id). Open Episode Detail to select an attempt.")
+    if st.button("Open Episode Detail", key=f"{ep_id}::screentime_missing_run_id", use_container_width=True):
+        st.switch_page("pages/2_Episode_Detail.py")
+    _stop_forever()
+if st.query_params.get("run_id") != run_id:
+    st.query_params["run_id"] = run_id
+
+st.caption(f"Run: `{ep_id}` / `{run_id}`")
+
+analytics_dir = run_layout.run_root(ep_id, run_id) / "analytics"
 
 # Job history section
 st.subheader("Recent Jobs")
 try:
     jobs_resp = helpers.api_get(f"/jobs?ep_id={ep_id}&job_type=screen_time_analyze")
     jobs_list = jobs_resp.get("jobs", [])
+    if run_id:
+        scoped_jobs = [job for job in jobs_list if (job.get("requested") or {}).get("run_id") == run_id]
+        if scoped_jobs:
+            jobs_list = scoped_jobs
     if jobs_list:
         job_table = []
         for job in jobs_list[:5]:  # Show last 5 jobs
@@ -471,8 +558,7 @@ col1, col2 = st.columns([3, 1])
 with col1:
     if st.button("Analyze Screen Time", use_container_width=True, type="primary"):
         try:
-            payload = {
-                "ep_id": ep_id,
+            params = {
                 "quality_min": quality_min,
                 "gap_tolerance_s": gap_tolerance_s,
                 "use_video_decode": use_video_decode,
@@ -481,18 +567,27 @@ with col1:
                 "track_coverage_min": track_coverage_min,
                 "preset": preset,
             }
-            resp = helpers.api_post("/jobs/screen_time/analyze", payload)
+            resp = helpers.api_post(
+                f"/episodes/{ep_id}/runs/{run_id}/jobs/screentime",
+                {"params": params},
+            )
             if not resp or not resp.get("job_id"):
                 st.error("Failed to start job: No job ID returned from API")
             else:
                 job_id = resp.get("job_id")
-                st.session_state[f"{ep_id}::current_screentime_job"] = job_id
+                job_state_key = f"{ep_id}::{run_id}::current_screentime_job"
+                st.session_state[job_state_key] = job_id
                 # Kick off overlay export in parallel so Timestamp Search has a fresh video
-                _ensure_export_job(ep_id)
+                _ensure_export_job(ep_id, run_id=run_id)
                 st.success(f"Screen time analysis job started: {job_id[:12]}...")
                 st.rerun()
         except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
+            st.error(
+                helpers.describe_error(
+                    f"{cfg['api_base']}/episodes/{ep_id}/runs/{run_id}/jobs/screentime",
+                    exc,
+                )
+            )
 with col2:
     if st.button("Refresh", use_container_width=True):
         st.rerun()
@@ -509,7 +604,8 @@ PHASE_LABELS = {
     "error": "Error",
 }
 
-current_job_id = st.session_state.get(f"{ep_id}::current_screentime_job")
+job_state_key = f"{ep_id}::{run_id}::current_screentime_job"
+current_job_id = st.session_state.get(job_state_key)
 if current_job_id:
     try:
         job_progress_resp = helpers.api_get(f"/jobs/{current_job_id}/progress")
@@ -548,7 +644,7 @@ if current_job_id:
         elif job_state in ("succeeded", "failed"):
             if job_state == "succeeded":
                 st.success(f"Job {current_job_id[:12]}... completed successfully!")
-                export_info = _ensure_export_job(ep_id)
+                export_info = _ensure_export_job(ep_id, run_id=run_id)
                 if export_info:
                     export_state = export_info.get("state")
                     export_progress = export_info.get("progress", {}) or {}
@@ -593,20 +689,28 @@ if current_job_id:
 
             # Clear the current job from session state
             if st.button("Clear Job Status", key=f"{ep_id}::clear_job_1"):
-                st.session_state.pop(f"{ep_id}::current_screentime_job", None)
+                st.session_state.pop(job_state_key, None)
                 st.rerun()
 
     except requests.RequestException:
         # Job not found or API error - clear from session
         if st.button("Clear Job Status", key=f"{ep_id}::clear_job_2"):
-            st.session_state.pop(f"{ep_id}::current_screentime_job", None)
+            st.session_state.pop(job_state_key, None)
             st.rerun()
 
 st.divider()
 
-if json_path.exists():
-    with json_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+data: Dict[str, Any] | None = None
+try:
+    data = helpers.api_get(f"/episodes/{ep_id}/runs/{run_id}/screentime")
+except requests.HTTPError as exc:
+    status = exc.response.status_code if exc.response else None
+    if status not in {404}:
+        st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/runs/{run_id}/screentime", exc))
+except requests.RequestException as exc:
+    st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/runs/{run_id}/screentime", exc))
+
+if data:
 
     st.subheader("Screen Time Results")
 
@@ -626,7 +730,7 @@ if json_path.exists():
     )
 
     # Overlay export quick actions tied to last generated results
-    export_info = _ensure_export_job(ep_id)
+    export_info = _ensure_export_job(ep_id, run_id=run_id)
     export_url = export_info.get("url") if export_info else None
     export_state = export_info.get("state") if export_info else None
     export_job_id = export_info.get("job_id") if export_info else None
@@ -732,6 +836,7 @@ if json_path.exists():
 
         # File-based persistence for manual screentime values
         manual_json_path = analytics_dir / "manual_screentime.json"
+        manual_state_key = f"{ep_id}::{run_id}::manual_screentime"
 
         def save_manual_values(values: dict) -> None:
             """Save manual screentime values to file."""
@@ -755,10 +860,10 @@ if json_path.exists():
                 manual_json_path.unlink()
 
         # Load manual values from file into session state if not already loaded
-        if f"{ep_id}::manual_screentime" not in st.session_state:
+        if manual_state_key not in st.session_state:
             persisted = load_manual_values()
             if persisted:
-                st.session_state[f"{ep_id}::manual_screentime"] = persisted
+                st.session_state[manual_state_key] = persisted
 
         # Manual screentime comparison section
         st.subheader("Manual Comparison")
@@ -774,7 +879,7 @@ if json_path.exists():
             uploaded_file = st.file_uploader(
                 "Upload CSV",
                 type=["csv"],
-                key=f"{ep_id}::manual_csv_upload",
+                key=f"{ep_id}::{run_id}::manual_csv_upload",
                 help="CSV should have 'Name' and 'Time' columns",
             )
 
@@ -790,7 +895,7 @@ if json_path.exists():
                                 manual_values[name] = parse_time_to_seconds(time_val)
                             else:
                                 manual_values[name] = float(time_val)
-                        st.session_state[f"{ep_id}::manual_screentime"] = manual_values
+                        st.session_state[manual_state_key] = manual_values
                         save_manual_values(manual_values)  # Persist to file
                         st.success(f"Loaded and saved {len(manual_values)} manual values")
                     else:
@@ -807,10 +912,10 @@ if json_path.exists():
                 value="",
                 height=150,
                 placeholder="BRONWYN 19.12\nWHITNEY 21.48\nANGIE 16.00\n...",
-                key=f"{ep_id}::manual_text_input",
+                key=f"{ep_id}::{run_id}::manual_text_input",
             )
 
-            if st.button("Apply Manual Values", key=f"{ep_id}::apply_manual"):
+            if st.button("Apply Manual Values", key=f"{ep_id}::{run_id}::apply_manual"):
                 manual_values = {}
                 for line in manual_text.strip().split("\n"):
                     line = line.strip()
@@ -834,7 +939,7 @@ if json_path.exists():
                         time_str = parts[1].strip()
                         manual_values[name] = parse_time_to_seconds(time_str)
                 if manual_values:
-                    st.session_state[f"{ep_id}::manual_screentime"] = manual_values
+                    st.session_state[manual_state_key] = manual_values
                     save_manual_values(manual_values)  # Persist to file
                     # Show what was parsed for verification
                     parsed_summary = ", ".join([f"{k}: {v:.0f}s" for k, v in list(manual_values.items())[:5]])
@@ -845,14 +950,14 @@ if json_path.exists():
                 else:
                     st.warning("No valid values found. Use format: Name, Time (e.g., ANGIE 16.00 for 16 seconds)")
 
-            if st.button("Clear Manual Values", key=f"{ep_id}::clear_manual"):
-                st.session_state.pop(f"{ep_id}::manual_screentime", None)
+            if st.button("Clear Manual Values", key=f"{ep_id}::{run_id}::clear_manual"):
+                st.session_state.pop(manual_state_key, None)
                 clear_manual_values()  # Delete file
                 st.success("Manual values cleared")
                 st.rerun()
 
         # Get manual values from session state
-        manual_screentime = st.session_state.get(f"{ep_id}::manual_screentime", {})
+        manual_screentime = st.session_state.get(manual_state_key, {})
 
         def find_manual_value(cast_name: str, manual_dict: dict) -> float:
             """Find manual value with flexible matching (exact, case-insensitive, first name)."""
@@ -1128,7 +1233,7 @@ if json_path.exists():
         st.subheader("Timeline Visualization")
 
         # Load scene cuts and FPS data
-        scene_cuts_data = _load_scene_cuts(ep_id)
+        scene_cuts_data = _load_scene_cuts(ep_id, run_id)
         video_fps = _load_video_fps(ep_id) or 24.0  # fallback to 24fps
         scene_cuts_available = (
             scene_cuts_data is not None
@@ -1137,9 +1242,9 @@ if json_path.exists():
         )
 
         # Load additional data for advanced options
-        tracks_data = _load_tracks(ep_id)
-        identities_data = _load_identities(ep_id)
-        skipped_faces_data = _load_skipped_faces(ep_id)
+        tracks_data = _load_tracks(ep_id, run_id)
+        identities_data = _load_identities(ep_id, run_id)
+        skipped_faces_data = _load_skipped_faces(ep_id, run_id)
         video_duration = 0.0
         try:
             video_meta = helpers.api_get(f"/episodes/{ep_id}/video_meta")
@@ -1665,6 +1770,7 @@ if json_path.exists():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("📋 Go to Faces Review", key="goto_faces_review_from_screentime", use_container_width=True):
+                    st.query_params["run_id"] = run_id
                     st.switch_page("pages/3_Faces_Review.py")
             with col2:
                 st.caption("Use the **Auto-Assign All** button in Faces Review to quickly assign clusters to cast.")

@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-from types import SimpleNamespace
+
+
 
 
 @pytest.fixture
@@ -69,19 +70,25 @@ class TestCeleryJobsRouter:
         """Detect/track Celery endpoint should forward advanced options to the task."""
         captured: dict = {}
 
-        def fake_delay(ep_id, options):
+        def _fake_enqueue(*, ep_id: str, run_id: str, stage: str, params: dict | None, source: str = "test") -> dict:
             captured["ep_id"] = ep_id
-            captured["options"] = options
-            return SimpleNamespace(id="job-123")
+            captured["run_id"] = run_id
+            captured["stage"] = stage
+            captured["params"] = params
+            return {
+                "status": "queued",
+                "ep_id": ep_id,
+                "run_id": run_id,
+                "stage": stage,
+                "job_id": "job-123",
+                "params_hash": "hash",
+            }
 
-        monkeypatch.setattr(
-            "apps.api.routers.celery_jobs.run_detect_track_task",
-            SimpleNamespace(delay=fake_delay),
-        )
-        monkeypatch.setattr("apps.api.routers.celery_jobs.check_active_job", lambda ep_id, op: None)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._enqueue_run_stage_job", _fake_enqueue)
 
         payload = {
             "ep_id": "demo-s01e01",
+            "run_id": "run-redis-opts",
             "stride": 3,
             "fps": 12.5,
             "device": "cpu",
@@ -106,7 +113,9 @@ class TestCeleryJobsRouter:
         resp = api_client.post("/celery_jobs/detect_track", json=payload)
         assert resp.status_code == 200
         assert captured["ep_id"] == "demo-s01e01"
-        options = captured["options"]
+        assert captured["run_id"] == "run-redis-opts"
+        assert captured["stage"] == "detect_track"
+        options = captured["params"]
         assert options["fps"] == pytest.approx(12.5)
         assert options["scene_min_len"] == 8
         assert options["scene_warmup_dets"] == 3
@@ -497,11 +506,12 @@ class TestLocalModeStreaming:
         # Skip cpulimit wrapper
         monkeypatch.setattr(
             "apps.api.routers.celery_jobs._maybe_wrap_with_cpulimit_local",
-            lambda cmd: (cmd, False)
+            lambda cmd, profile="balanced": (cmd, False)
         )
 
         payload = {
             "ep_id": "test-streaming",
+            "run_id": "run-streaming-1",
             "stride": 6,
             "device": "cpu",
             "execution_mode": "local",
@@ -511,7 +521,7 @@ class TestLocalModeStreaming:
         response = api_client.post(
             "/celery_jobs/detect_track",
             json=payload,
-            # headers={"Accept": "application/x-ndjson"}  # Signal we want streaming
+            headers={"Accept": "application/x-ndjson"},  # Signal we want streaming
         )
 
         # Should return 200 with streaming content type
@@ -559,7 +569,7 @@ class TestLocalModeStreaming:
         )
         monkeypatch.setattr(
             "apps.api.routers.celery_jobs._maybe_wrap_with_cpulimit_local",
-            lambda cmd: (cmd, False)
+            lambda cmd, profile="balanced": (cmd, False)
         )
         monkeypatch.setattr(
             "apps.api.routers.celery_jobs.save_operation_logs",

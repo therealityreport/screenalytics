@@ -4,45 +4,53 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Set
 
 from py_screenalytics import run_layout
-from py_screenalytics.artifacts import get_path
 
 from apps.api.services.run_state import run_state_service
+from apps.api.services.storage import StorageService
 
 LOGGER = logging.getLogger(__name__)
+_STORAGE = StorageService()
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _read_json(path: Path) -> Any:
+def _read_json_from_s3(key: str | None) -> Any:
+    if not key:
+        return None
+    payload = _STORAGE.download_bytes(key)
+    if not payload:
+        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
-def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
-    if not path.exists():
+def _iter_jsonl_from_s3(key: str | None) -> Iterable[Dict[str, Any]]:
+    if not key:
         return []
+    payload = _STORAGE.download_bytes(key)
+    if not payload:
+        return []
+
     def _generator() -> Iterable[Dict[str, Any]]:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict):
-                    yield row
+        for line in payload.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                yield row
+
     return _generator()
 
 
@@ -57,30 +65,16 @@ def _parse_track_id(raw: Any) -> int | None:
         return None
 
 
-def _crop_exists(
-    frames_root: Path,
-    run_id: str,
-    rel_path: str,
-) -> bool:
-    cleaned = rel_path.lstrip("/\\")
-    if cleaned.startswith("crops/"):
-        cleaned = cleaned[len("crops/") :]
-    candidates = [
-        frames_root / "runs" / run_id / "crops" / cleaned,
-        frames_root / "crops" / cleaned,
-    ]
-    return any(candidate.exists() for candidate in candidates)
 
 
 def validate_run_integrity(
     ep_id: str,
     run_id: str,
     *,
-    data_root: Path | str | None = None,
+    data_root: str | None = None,
 ) -> Dict[str, Any]:
     """Return a structured validation report for run artifacts."""
     run_id_norm = run_layout.normalize_run_id(run_id)
-    run_root = run_layout.run_root(ep_id, run_id_norm)
     now = _now_iso()
 
     errors: List[Dict[str, Any]] = []
@@ -92,59 +86,66 @@ def validate_run_integrity(
         "track_reps": 0,
     }
 
-    if not run_root.exists():
-        errors.append(
-            {
-                "code": "missing_run_root",
-                "message": "Run artifacts folder not found on disk.",
-                "details": {"run_root": str(run_root)},
-            }
-        )
-        return {
-            "ep_id": ep_id,
-            "run_id": run_id_norm,
-            "generated_at": now,
-            "errors": errors,
-            "warnings": warnings,
-            "stats": stats,
-            "summary": {
-                "blocking": True,
-                "error_count": len(errors),
-                "warning_count": len(warnings),
-                "blocking_issues": [err.get("code") for err in errors],
-            },
-        }
-
-    tracks_path = run_root / "tracks.jsonl"
-    faces_path = run_root / "faces.jsonl"
-    identities_path = run_root / "identities.json"
-    reps_path = run_root / "track_reps.jsonl"
-
     artifact_pointers: Dict[str, Any] = {}
     faces_artifacts: Dict[str, Any] = {}
+    tracks_artifacts: Dict[str, Any] = {}
+    identities_artifacts: Dict[str, Any] = {}
+    reps_artifacts: Dict[str, Any] = {}
+    embeddings_artifacts: Dict[str, Any] = {}
     try:
         run_state_bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id_norm)
         run_state_payload = run_state_bundle.get("run_state") if isinstance(run_state_bundle, dict) else None
         if isinstance(run_state_payload, dict):
             artifact_pointers = run_state_payload.get("artifacts") if isinstance(run_state_payload.get("artifacts"), dict) else {}
             faces_artifacts = artifact_pointers.get("faces") if isinstance(artifact_pointers.get("faces"), dict) else {}
+            tracks_artifacts = artifact_pointers.get("tracks") if isinstance(artifact_pointers.get("tracks"), dict) else {}
+            identities_artifacts = artifact_pointers.get("identities") if isinstance(artifact_pointers.get("identities"), dict) else {}
+            reps_artifacts = artifact_pointers.get("track_reps") if isinstance(artifact_pointers.get("track_reps"), dict) else {}
+            embeddings_artifacts = artifact_pointers.get("embeddings") if isinstance(artifact_pointers.get("embeddings"), dict) else {}
     except Exception as exc:
         LOGGER.debug("Run state lookup failed for validator (%s/%s): %s", ep_id, run_id_norm, exc)
         artifact_pointers = {}
         faces_artifacts = {}
+        tracks_artifacts = {}
+        identities_artifacts = {}
+        reps_artifacts = {}
+        embeddings_artifacts = {}
+
+    tracks_key = tracks_artifacts.get("s3_key") or run_layout.run_artifact_s3_key(ep_id, run_id_norm, "tracks.jsonl")
+    identities_key = (
+        identities_artifacts.get("s3_key") or run_layout.run_artifact_s3_key(ep_id, run_id_norm, "identities.json")
+    )
+    reps_key = reps_artifacts.get("s3_key") or run_layout.run_artifact_s3_key(ep_id, run_id_norm, "track_reps.jsonl")
+    embeddings_key = embeddings_artifacts.get("s3_key") or run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.npy")
+    faces_manifest_key = (
+        faces_artifacts.get("manifest_key")
+        or faces_artifacts.get("s3_key")
+        or run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl")
+    )
+
+    tracks_exists = tracks_artifacts.get("exists")
+    if tracks_exists is None and tracks_key:
+        tracks_exists = _STORAGE.object_exists(tracks_key)
+    identities_exists = identities_artifacts.get("exists")
+    if identities_exists is None and identities_key:
+        identities_exists = _STORAGE.object_exists(identities_key)
+    reps_exists = reps_artifacts.get("exists")
+    if reps_exists is None and reps_key:
+        reps_exists = _STORAGE.object_exists(reps_key)
+    embeddings_exists = embeddings_artifacts.get("exists")
+    if embeddings_exists is None and embeddings_key:
+        embeddings_exists = _STORAGE.object_exists(embeddings_key)
+    faces_manifest_exists = faces_artifacts.get("manifest_exists")
+    if faces_manifest_exists is None and faces_manifest_key:
+        faces_manifest_exists = _STORAGE.object_exists(faces_manifest_key)
 
     faces_source = faces_artifacts.get("source")
-    faces_manifest_path = faces_artifacts.get("manifest_path") or str(faces_path)
-    faces_manifest_key = faces_artifacts.get("manifest_key") or faces_artifacts.get("s3_key")
-    faces_manifest_exists = faces_artifacts.get("manifest_exists")
-    if faces_manifest_exists is None:
-        faces_manifest_exists = faces_path.exists()
     if faces_source is None:
         if faces_manifest_exists:
             faces_source = "manifest"
-        elif reps_path.exists() or (Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser() / "embeds" / ep_id / "runs" / run_id_norm / "faces.npy").exists():
+        elif embeddings_exists or reps_exists:
             faces_source = "embeddings"
-        elif tracks_path.exists():
+        elif tracks_exists:
             faces_source = "tracks"
 
     track_ids: Set[int] = set()
@@ -161,16 +162,16 @@ def validate_run_integrity(
     missing_tracks_for_reps = 0
     missing_crops_for_reps = 0
 
-    if not tracks_path.exists():
+    if not tracks_exists:
         errors.append(
             {
                 "code": "missing_tracks",
                 "message": "tracks.jsonl is missing for this run.",
-                "details": {"path": str(tracks_path)},
+                "details": {"s3_key": tracks_key},
             }
         )
     else:
-        for row in _iter_jsonl(tracks_path):
+        for row in _iter_jsonl_from_s3(tracks_key):
             track_id = _parse_track_id(row.get("track_id") or row.get("track"))
             if track_id is None:
                 continue
@@ -192,7 +193,7 @@ def validate_run_integrity(
                     "code": "missing_faces",
                     "message": "faces.jsonl is missing for this run.",
                     "details": {
-                        "path": faces_manifest_path,
+                        "s3_key": faces_manifest_key,
                         "faces_source": faces_source,
                         "manifest_key": faces_manifest_key,
                     },
@@ -204,14 +205,14 @@ def validate_run_integrity(
                     "code": "faces_manifest_missing",
                     "message": "faces.jsonl is missing; using alternate faces source.",
                     "details": {
-                        "path": faces_manifest_path,
+                        "s3_key": faces_manifest_key,
                         "faces_source": faces_source,
                         "manifest_key": faces_manifest_key,
                     },
                 }
             )
     else:
-        for row in _iter_jsonl(faces_path):
+        for row in _iter_jsonl_from_s3(faces_manifest_key):
             track_id = _parse_track_id(row.get("track_id") or row.get("track"))
             if track_id is not None and track_id not in track_ids and track_ids:
                 missing_tracks_for_faces += 1
@@ -220,17 +221,17 @@ def validate_run_integrity(
                 face_ids.add(str(face_id))
         stats["faces"] = len(face_ids) if face_ids else stats.get("faces", 0)
 
-    if not identities_path.exists():
+    if not identities_exists:
         errors.append(
             {
                 "code": "missing_identities",
                 "message": "identities.json is missing for this run.",
-                "details": {"path": str(identities_path)},
+                "details": {"s3_key": identities_key},
             }
         )
         identities_payload: Dict[str, Any] = {}
     else:
-        payload = _read_json(identities_path)
+        payload = _read_json_from_s3(identities_key)
         identities_payload = payload if isinstance(payload, dict) else {}
         identities = identities_payload.get("identities")
         if isinstance(identities, list):
@@ -250,20 +251,26 @@ def validate_run_integrity(
                         missing_tracks_for_identities += 1
         stats["identities"] = len(identity_ids)
 
-    if reps_path.exists():
-        for row in _iter_jsonl(reps_path):
+    if reps_exists:
+        for row in _iter_jsonl_from_s3(reps_key):
             track_id = _parse_track_id(row.get("track_id") or row.get("track"))
             if track_id is not None:
                 rep_track_ids.add(track_id)
                 rep_lookup[track_id] = row
                 if track_id not in track_ids and track_ids:
                     missing_tracks_for_reps += 1
-
-            crop_rel = row.get("best_crop_rel_path") or row.get("crop_rel_path")
-            if isinstance(crop_rel, str):
-                frames_root = get_path(ep_id, "frames_root")
-                if not _crop_exists(frames_root, run_id_norm, crop_rel):
+            crop_key = (
+                row.get("best_crop_s3_key")
+                or row.get("crop_s3_key")
+                or row.get("rep_crop_s3_key")
+                or row.get("thumb_s3_key")
+                or row.get("rep_thumb_s3_key")
+            )
+            if crop_key:
+                if not _STORAGE.object_exists(str(crop_key)):
                     missing_crops_for_reps += 1
+            else:
+                missing_crops_for_reps += 1
         stats["track_reps"] = len(rep_track_ids)
 
     if missing_tracks_for_faces:
@@ -295,7 +302,7 @@ def validate_run_integrity(
     if track_ids and identity_track_ids:
         missing_cluster_refs = track_ids - identity_track_ids
         if missing_cluster_refs:
-            reps_present = reps_path.exists()
+            reps_present = bool(reps_exists)
             for track_id in sorted(missing_cluster_refs):
                 reason = "not_in_identities"
                 track_row = track_rows.get(track_id, {})
@@ -385,35 +392,14 @@ def validate_run_integrity(
             }
         )
 
-    embeddings_path = None
-    if data_root is None:
-        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-    embeds_root = Path(data_root) / "embeds" / ep_id / "runs" / run_id_norm
-    embeddings_path = embeds_root / "faces.npy"
-    if stats.get("faces", 0) and not embeddings_path.exists():
+    if stats.get("faces", 0) and not embeddings_exists:
         warnings.append(
             {
                 "code": "missing_embeddings",
                 "message": "Embeddings file missing for faces.",
-                "details": {"path": str(embeddings_path)},
+                "details": {"s3_key": embeddings_key},
             }
         )
-    elif embeddings_path.exists() and stats.get("faces", 0):
-        try:
-            import numpy as np  # type: ignore
-
-            embeddings = np.load(str(embeddings_path), mmap_mode="r")
-            embed_count = int(embeddings.shape[0]) if hasattr(embeddings, "shape") else None
-            if embed_count is not None and face_ids and embed_count != len(face_ids):
-                warnings.append(
-                    {
-                        "code": "embedding_count_mismatch",
-                        "message": "Embeddings count does not match faces count.",
-                        "details": {"embeddings": embed_count, "faces": len(face_ids)},
-                    }
-                )
-        except Exception as exc:  # pragma: no cover - best effort
-            LOGGER.debug("Embedding check skipped: %s", exc)
 
     if faces_estimate_present and not stats.get("faces"):
         stats["faces_estimate"] = faces_estimate
@@ -428,7 +414,6 @@ def validate_run_integrity(
         "artifact_pointers": {
             "faces": {
                 "source": faces_source,
-                "manifest_path": faces_manifest_path,
                 "manifest_key": faces_manifest_key,
                 "manifest_exists": faces_manifest_exists,
                 "exists": faces_artifacts.get("exists") if faces_artifacts else None,

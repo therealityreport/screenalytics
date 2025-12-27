@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
 import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -53,6 +53,12 @@ from apps.api.services.storage import (
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
+
+
+def _require_s3_storage() -> None:
+    if STORAGE.backend not in {"s3", "minio"} or STORAGE._client is None or not STORAGE.bucket:
+        detail = STORAGE.init_error or "S3 is not configured for media access."
+        raise HTTPException(status_code=503, detail=f"S3 misconfigured: {detail}")
 JOB_SERVICE = JobService()
 LOGGER = logging.getLogger(__name__)
 
@@ -89,6 +95,13 @@ def _normalize_run_id(run_id: str | None) -> str | None:
     if not candidate:
         return None
     return run_layout.normalize_run_id(candidate)
+
+
+def _require_run_id(run_id: str | None) -> str:
+    run_id_norm = _normalize_run_id(run_id)
+    if not run_id_norm:
+        raise ValueError("run_id is required")
+    return run_id_norm
 
 
 def _manifests_dir_for_run(ep_id: str, run_id: str | None) -> Path:
@@ -1292,17 +1305,46 @@ def _parse_frame_idx_from_name(name: str) -> int | None:
         return None
 
 
-def _track_crop_candidates(ep_id: str, track_id: int) -> List[Path]:
+def _track_crop_candidates(
+    ep_id: str,
+    track_id: int,
+    *,
+    crops_roots: List[Path] | None = None,
+) -> List[Path]:
     track_component = f"track_{track_id:04d}"
+    candidates: List[Path] = []
+    if crops_roots:
+        for root in crops_roots:
+            if not root:
+                continue
+            path = Path(root) / track_component
+            if path not in candidates:
+                candidates.append(path)
+        return candidates
     frames_root = get_path(ep_id, "frames_root")
     primary = frames_root / "crops" / track_component
-    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy = fallback_root / ep_id / "tracks" / track_component
-    candidates: List[Path] = []
-    for path in (primary, legacy):
-        if path not in candidates:
-            candidates.append(path)
+    if primary not in candidates:
+        candidates.append(primary)
     return candidates
+
+
+def _resolve_crops_prefix(ep_id: str, run_id: str) -> tuple[str | None, str]:
+    prefix: str | None = None
+    source = "unknown"
+    try:
+        bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id)
+        run_state_payload = bundle.get("run_state") if isinstance(bundle, dict) else None
+        artifacts = run_state_payload.get("artifacts") if isinstance(run_state_payload, dict) else {}
+        crops = artifacts.get("crops") if isinstance(artifacts, dict) else {}
+        prefix = crops.get("s3_prefix")
+        if prefix:
+            source = "run_state"
+    except Exception as exc:
+        LOGGER.debug("[crops] run_state unavailable for %s/%s: %s", ep_id, run_id, exc)
+    if not prefix:
+        prefix = f"{run_layout.run_s3_prefix(ep_id, run_id)}crops/"
+        source = "default"
+    return prefix, source
 
 
 def _load_crop_index(path: Path) -> List[Dict[str, Any]]:
@@ -1334,9 +1376,14 @@ def _load_crop_index(path: Path) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _discover_crop_entries(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
+def _discover_crop_entries(
+    ep_id: str,
+    track_id: int,
+    *,
+    crops_roots: List[Path] | None = None,
+) -> List[Dict[str, Any]]:
     track_component = f"track_{track_id:04d}"
-    for root in _track_crop_candidates(ep_id, track_id):
+    for root in _track_crop_candidates(ep_id, track_id, crops_roots=crops_roots):
         if not root.exists():
             continue
         entries = _load_crop_index(root)
@@ -1377,14 +1424,27 @@ def _list_track_frame_media(
     page: int,
     page_size: int,
     include_skipped: bool = False,
+    *,
+    run_id: str | None = None,
 ) -> Dict[str, Any]:
     sample = max(1, sample)
     page = max(1, page)
     page_size = max(1, min(page_size, TRACK_LIST_MAX_LIMIT))
 
     # Load faces with or without skipped entries based on parameter
-    all_faces = _load_faces(ep_id, include_skipped=include_skipped)
+    all_faces = _load_faces(ep_id, include_skipped=include_skipped, run_id=run_id)
+    map_faces = all_faces
+    if not include_skipped:
+        map_faces = _load_faces(ep_id, include_skipped=True, run_id=run_id)
     face_rows: Dict[int, Dict[str, Any]] = {}
+    frame_track_map: Dict[int, set[int]] = defaultdict(set)
+    for row in map_faces:
+        try:
+            tid = int(row.get("track_id", -1))
+            frame_idx = int(row.get("frame_idx", -1))
+        except (TypeError, ValueError):
+            continue
+        frame_track_map[frame_idx].add(tid)
     for row in all_faces:
         try:
             tid = int(row.get("track_id", -1))
@@ -1394,9 +1454,8 @@ def _list_track_frame_media(
         if tid != track_id:
             continue
         face_rows.setdefault(frame_idx, row)
-    crops = _discover_crop_entries(ep_id, track_id)
-    ctx, prefixes = _require_episode_context(ep_id)
-    crops_prefix = (prefixes or {}).get("crops") if prefixes else None
+    crops: List[Dict[str, Any]] = []
+    crops_prefix: str | None = None
 
     # Load track centroid for similarity computation and quality scoring functions
     try:
@@ -1407,7 +1466,7 @@ def _list_track_frame_media(
         )
         import numpy as np
 
-        track_reps = load_track_reps(ep_id)
+        track_reps = load_track_reps(ep_id, run_id=run_id)
         track_rep = track_reps.get(f"track_{track_id:04d}", {})
         track_centroid = np.array(track_rep.get("embed", []), dtype=np.float32) if track_rep else None
     except Exception:
@@ -1477,6 +1536,7 @@ def _list_track_frame_media(
                     "score": round(float(quality_score), 4),
                 }
 
+            other_tracks = sorted(tid for tid in frame_track_map.get(idx, set()) if tid != track_id)
             items.append(
                 {
                     "track_id": track_id,
@@ -1490,6 +1550,8 @@ def _list_track_frame_media(
                     "h": meta.get("crop_height") or meta.get("height"),
                     "skip": meta.get("skip"),
                     "face_id": meta.get("face_id"),
+                    "faces": [meta] if meta else [],
+                    "other_tracks": other_tracks,
                     "similarity": similarity,
                     "quality": quality,
                 }
@@ -1534,14 +1596,12 @@ def _list_track_frame_media(
         # Without this, the UI would show frames that can't be moved/deleted
         if not meta:
             continue
-        local_path = entry.get("abs_path")
-        local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
         s3_key = None
         if crops_prefix and rel_path:
             suffix = rel_path.split("crops/", 1)[-1]
             s3_key = f"{crops_prefix}{suffix}"
-        media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
+        media_url = _resolve_crop_url(ep_id, rel_path, s3_key)
         fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
         url = media_url or fallback
 
@@ -1568,6 +1628,9 @@ def _list_track_frame_media(
                 "score": round(float(quality_score), 4),
             }
 
+        other_tracks = sorted(
+            tid for tid in frame_track_map.get(frame_idx, set()) if tid != track_id
+        )
         items.append(
             {
                 "track_id": track_id,
@@ -1581,6 +1644,8 @@ def _list_track_frame_media(
                 "h": meta.get("crop_height") or meta.get("height"),
                 "skip": meta.get("skip"),
                 "face_id": meta.get("face_id"),
+                "faces": [meta] if meta else [],
+                "other_tracks": other_tracks,
                 "similarity": similarity,
                 "quality": quality,
             }
@@ -1597,11 +1662,23 @@ def _list_track_frame_media(
     }
 
 
-def _count_track_crops(ctx, track_id: int) -> int:
+def _count_track_crops(
+    ctx,
+    track_id: int,
+    *,
+    crops_prefix: str | None = None,
+) -> int:
     total = 0
     cursor: str | None = None
     while True:
-        payload = STORAGE.list_track_crops(ctx, track_id, sample=1, max_keys=500, start_after=cursor)
+        payload = STORAGE.list_track_crops(
+            ctx,
+            track_id,
+            sample=1,
+            max_keys=500,
+            start_after=cursor,
+            crops_prefix=crops_prefix,
+        )
         items = payload.get("items", []) if isinstance(payload, dict) else []
         total += len(items)
         cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
@@ -2512,38 +2589,13 @@ class RunStageJobRequest(BaseModel):
     )
 
 
-@router.get("/episodes/{ep_id}/runs/{run_id}/state", tags=["episodes"])
-def get_run_processing_state(
-    ep_id: str,
-    run_id: str,
-) -> dict:
-    ep_id_norm = normalize_ep_id(ep_id)
-    try:
-        run_id_norm = run_layout.normalize_run_id(run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return run_state_service.get_state(ep_id=ep_id_norm, run_id=run_id_norm)
-
-
-@router.get("/episodes/{ep_id}/runs/{run_id}/integrity", tags=["episodes"])
-def get_run_integrity(
-    ep_id: str,
-    run_id: str,
-) -> dict:
-    ep_id_norm = normalize_ep_id(ep_id)
-    try:
-        run_id_norm = run_layout.normalize_run_id(run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return validate_run_integrity(ep_id_norm, run_id_norm)
-
-
-@router.post("/episodes/{ep_id}/runs/{run_id}/jobs/{stage}", tags=["episodes"])
-def trigger_run_stage_job(
+def _enqueue_run_stage_job(
+    *,
     ep_id: str,
     run_id: str,
     stage: str,
-    payload: RunStageJobRequest = Body(default=RunStageJobRequest()),
+    params: Dict[str, Any] | None,
+    source: str = "api",
 ) -> dict:
     ep_id_norm = normalize_ep_id(ep_id)
     stage_norm = (stage or "").strip().lower()
@@ -2555,7 +2607,7 @@ def trigger_run_stage_job(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    params = payload.params or {}
+    params = params or {}
     params_hash = compute_params_hash(params)
     existing = run_state_service.current_stage_entry(
         ep_id=ep_id_norm,
@@ -2582,7 +2634,7 @@ def trigger_run_stage_job(
         progress=0.0,
         params=params,
         params_hash=params_hash,
-        source="api",
+        source=source,
     )
 
     job_id: str | None = None
@@ -2635,7 +2687,7 @@ def trigger_run_stage_job(
                         progress=0.0,
                         job_id=job_id,
                         params=params,
-                        source="api",
+                        source=source,
                     )
                     if export_format == "zip":
                         build_run_debug_bundle_zip(ep_id=ep_id_norm, run_id=run_id_norm)
@@ -2651,7 +2703,7 @@ def trigger_run_stage_job(
                         progress=1.0,
                         job_id=job_id,
                         params=params,
-                        source="api",
+                        source=source,
                     )
                 except Exception as exc:
                     run_state_service.update_stage(
@@ -2662,7 +2714,7 @@ def trigger_run_stage_job(
                         last_error=str(exc),
                         job_id=job_id,
                         params=params,
-                        source="api",
+                        source=source,
                     )
 
             thread = threading.Thread(target=_export_worker, name=f"run-export-{job_id}", daemon=True)
@@ -2676,7 +2728,7 @@ def trigger_run_stage_job(
             last_error=str(exc),
             params=params,
             params_hash=params_hash,
-            source="api",
+            source=source,
         )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -2688,7 +2740,7 @@ def trigger_run_stage_job(
             last_error=str(exc),
             params=params,
             params_hash=params_hash,
-            source="api",
+            source=source,
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -2702,7 +2754,7 @@ def trigger_run_stage_job(
             job_id=job_id,
             params=params,
             params_hash=params_hash,
-            source="api",
+            source=source,
         )
 
     return {
@@ -2713,6 +2765,98 @@ def trigger_run_stage_job(
         "job_id": job_id,
         "params_hash": params_hash,
     }
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/state", tags=["episodes"])
+def get_run_processing_state(
+    ep_id: str,
+    run_id: str,
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return run_state_service.get_state(ep_id=ep_id_norm, run_id=run_id_norm)
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/integrity", tags=["episodes"])
+def get_run_integrity(
+    ep_id: str,
+    run_id: str,
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return validate_run_integrity(ep_id_norm, run_id_norm)
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/screentime", tags=["episodes"])
+def get_run_screentime(
+    ep_id: str,
+    run_id: str,
+    output: str = Query("json", description="Output format: json or csv"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
+    exports: dict = {}
+    try:
+        state = run_state_service.get_state(ep_id=ep_id_norm, run_id=run_id_norm)
+        run_state = state.get("run_state") if isinstance(state, dict) else None
+        artifacts = run_state.get("artifacts") if isinstance(run_state, dict) else {}
+        exports = artifacts.get("exports") if isinstance(artifacts, dict) else {}
+    except Exception as exc:
+        LOGGER.debug("[screentime] run_state unavailable for %s/%s: %s", ep_id_norm, run_id_norm, exc)
+
+    format_value = (output or "json").strip().lower()
+    if format_value not in {"json", "csv"}:
+        raise HTTPException(status_code=422, detail="output must be 'json' or 'csv'")
+
+    if format_value == "csv":
+        csv_entry = exports.get("screentime_csv") if isinstance(exports, dict) else None
+        csv_key = csv_entry.get("s3_key") if isinstance(csv_entry, dict) else None
+        if not csv_key:
+            raise HTTPException(status_code=404, detail="screentime.csv not found")
+        url = STORAGE.presign_get(csv_key, content_type="text/csv")
+        if not url:
+            raise HTTPException(status_code=503, detail="S3 misconfigured: failed to presign screentime.csv")
+        return {"ep_id": ep_id_norm, "run_id": run_id_norm, "url": url, "s3_key": csv_key}
+
+    json_entry = exports.get("screentime_json") if isinstance(exports, dict) else None
+    json_key = json_entry.get("s3_key") if isinstance(json_entry, dict) else None
+    if not json_key:
+        raise HTTPException(status_code=404, detail="screentime.json not found")
+    try:
+        response = STORAGE._client.get_object(Bucket=STORAGE.bucket, Key=json_key)
+        payload = json.loads(response["Body"].read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read screentime.json from S3: {exc}") from exc
+    if isinstance(payload, dict):
+        payload.setdefault("ep_id", ep_id_norm)
+        payload.setdefault("run_id", run_id_norm)
+    return payload if isinstance(payload, dict) else {"ep_id": ep_id_norm, "run_id": run_id_norm, "payload": payload}
+
+
+@router.post("/episodes/{ep_id}/runs/{run_id}/jobs/{stage}", tags=["episodes"])
+def trigger_run_stage_job(
+    ep_id: str,
+    run_id: str,
+    stage: str,
+    payload: RunStageJobRequest = Body(default=RunStageJobRequest()),
+) -> dict:
+    return _enqueue_run_stage_job(
+        ep_id=ep_id,
+        run_id=run_id,
+        stage=stage,
+        params=payload.params,
+        source="api",
+    )
 
 
 @router.get(
@@ -2828,9 +2972,13 @@ def presign_episode_assets(ep_id: str) -> AssetUploadResponse:
     if not record:
         raise HTTPException(status_code=404, detail="Episode not found")
 
+    _require_s3_storage()
     ensure_dirs(ep_id)
     v2_key = STORAGE.video_object_key_v2(record.show_ref, record.season_number, record.episode_number)
-    presigned = STORAGE.presign_episode_video(ep_id, object_key=v2_key)
+    try:
+        presigned = STORAGE.presign_episode_video(ep_id, object_key=v2_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     local_video_path = get_path(ep_id, "video")
     path = presigned.path or (str(local_video_path) if presigned.method == "FILE" else None)
 
@@ -3551,9 +3699,12 @@ def episode_video_meta(ep_id: str) -> EpisodeVideoMeta:
 
 
 @router.get("/episodes/{ep_id}/identities")
-def list_identities(ep_id: str, run_id: str | None = Query(None)) -> dict:
+def list_identities(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
     try:
-        run_id_norm = _normalize_run_id(run_id)
+        run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -3606,19 +3757,20 @@ def list_identities(ep_id: str, run_id: str | None = Query(None)) -> dict:
                 except ValueError:
                     # Ignore duplicates when multiple workers enqueue roster seeds.
                     pass
-    return {"identities": identities, "stats": payload.get("stats", {}), "run_id": run_id_norm or "legacy"}
+    return {"identities": identities, "stats": payload.get("stats", {}), "run_id": run_id_norm}
 
 
 @router.get("/episodes/{ep_id}/cluster_tracks")
 def list_cluster_tracks(
     ep_id: str,
     limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
-    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+    run_id: str = Query(..., description="Run id scope (required)"),
 ) -> dict:
     try:
-        run_id_norm = _normalize_run_id(run_id)
+        run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     try:
         payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster, run_id=run_id_norm)
     except ValueError as exc:
@@ -3635,19 +3787,19 @@ def list_cluster_tracks(
             if media_url:
                 track["rep_media_url"] = media_url
                 track["rep_thumb_url"] = media_url
-    payload.setdefault("run_id", run_id_norm or "legacy")
+    payload.setdefault("run_id", run_id_norm)
     return payload
 
 
 @router.get("/episodes/{ep_id}/faces_review_bundle")
 def get_faces_review_bundle(
     ep_id: str,
-    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+    run_id: str = Query(..., description="Run id scope for artifacts/state (required)"),
     filter_cast_id: str | None = Query(None, description="Optional cast_id filter for bundle output"),
     include_archived: bool = Query(False, description="Include archived clusters/tracks in bundle"),
 ) -> dict:
     try:
-        run_id_norm = _normalize_run_id(run_id)
+        run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
@@ -3803,14 +3955,14 @@ def get_cluster_track_reps(
     ep_id: str,
     cluster_id: str,
     frames_per_track: int = Query(0, ge=0, le=20, description="Number of sample frames to include per track (0=none)"),
-    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+    run_id: str = Query(..., description="Run id scope for artifacts/state (required)"),
 ) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster.
 
     If frames_per_track > 0, includes sample frames for each track for inline display.
     """
     try:
-        run_id_norm = _normalize_run_id(run_id)
+        run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -3898,7 +4050,7 @@ def get_cluster_track_reps(
 def get_person_clusters_summary(
     ep_id: str,
     person_id: str,
-    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+    run_id: str = Query(..., description="Run id scope for artifacts/state (required)"),
 ) -> dict:
     """Get clusters summary with track representatives for a person in an episode."""
     try:
@@ -3909,7 +4061,7 @@ def get_person_clusters_summary(
         )
 
         try:
-            run_id_norm = _normalize_run_id(run_id)
+            run_id_norm = _require_run_id(run_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -4894,9 +5046,13 @@ def generate_singleton_suggestions(
 
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
-def track_detail(ep_id: str, track_id: int, run_id: str | None = Query(None)) -> dict:
+def track_detail(
+    ep_id: str,
+    track_id: int,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
     try:
-        run_id_norm = _normalize_run_id(run_id)
+        run_id_norm = _require_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -4948,10 +5104,24 @@ def list_track_crops(
     sample: int = Query(1, ge=1, le=100, description="Return every Nth crop"),
     limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
     start_after: str | None = Query(None, description="Opaque cursor returned by the previous call"),
+    run_id: str = Query(..., description="Run id scope (required)"),
 ) -> Dict[str, Any]:
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     ctx, _ = _require_episode_context(ep_id)
-    payload = STORAGE.list_track_crops(ctx, track_id, sample=sample, max_keys=limit, start_after=start_after)
-    face_rows = _track_face_rows(ep_id, track_id)
+    crops_prefix, crops_source = _resolve_crops_prefix(ep_id, run_id_norm)
+    payload = STORAGE.list_track_crops(
+        ctx,
+        track_id,
+        sample=sample,
+        max_keys=limit,
+        start_after=start_after,
+        crops_prefix=crops_prefix,
+    )
+    face_rows = _track_face_rows(ep_id, track_id, run_id=run_id_norm)
     items = payload.get("items", []) if isinstance(payload, dict) else []
     for item in items:
         frame_idx = item.get("frame_idx")
@@ -4985,6 +5155,9 @@ def list_track_crops(
             limit=limit,
         )
 
+    if isinstance(payload, dict):
+        payload.setdefault("run_id", run_id_norm)
+        payload.setdefault("crops_source", crops_source)
     return payload
 
 
@@ -4996,19 +5169,42 @@ def list_track_frames(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=TRACK_LIST_MAX_LIMIT),
     include_skipped: bool = Query(False, description="Include faces marked as skipped"),
+    run_id: str = Query(..., description="Run id scope (required)"),
 ) -> Dict[str, Any]:
-    return _list_track_frame_media(ep_id, track_id, sample, page, page_size, include_skipped)
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
+    return _list_track_frame_media(
+        ep_id,
+        track_id,
+        sample,
+        page,
+        page_size,
+        include_skipped,
+        run_id=run_id_norm,
+    )
 
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}/integrity")
-def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
+def track_integrity(
+    ep_id: str,
+    track_id: int,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> Dict[str, Any]:
     """Check integrity of a track's faces manifest vs crops on disk.
 
     Returns counts for all faces (including skipped) to properly detect
     cases where all faces were auto-skipped due to quality filters.
     """
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _require_s3_storage()
     # Load ALL faces including skipped to get accurate counts
-    all_faces = _load_faces(ep_id, include_skipped=True)
+    all_faces = _load_faces(ep_id, include_skipped=True, run_id=run_id_norm)
     track_faces = [f for f in all_faces if f.get("track_id") == track_id]
 
     total_faces = len(track_faces)
@@ -5016,17 +5212,20 @@ def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
     active_faces = total_faces - skipped_faces
 
     ctx, _ = _require_episode_context(ep_id)
-    crops = _count_track_crops(ctx, track_id)
+    crops_prefix, crops_source = _resolve_crops_prefix(ep_id, run_id_norm)
+    crops = _count_track_crops(ctx, track_id, crops_prefix=crops_prefix)
 
     # Track is OK if it has ANY faces (even if all skipped) and crops exist
     ok = crops >= total_faces > 0
 
     return {
         "track_id": track_id,
+        "run_id": run_id_norm,
         "faces_manifest": total_faces,
         "faces_active": active_faces,
         "faces_skipped": skipped_faces,
         "crops_files": crops,
+        "crops_source": crops_source,
         "ok": ok,
         "all_skipped": skipped_faces == total_faces and total_faces > 0,
     }
