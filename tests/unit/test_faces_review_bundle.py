@@ -89,7 +89,7 @@ def test_bundle_filters_by_cast_id_not_person_id(monkeypatch: pytest.MonkeyPatch
                 "person_id": "p_0001",
                 "name": "Person One",
                 "cast_id": "cast_1",
-                "cluster_ids": [f"{ep_id}:{RUN_ID}:c1"],
+                "cluster_ids": [],
             }
         ],
     )
@@ -360,6 +360,46 @@ def test_bundle_cast_gallery_run_scoped(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     assert bundle_one["cast_gallery_cards"][0]["episode_clusters"] == ["c1"]
     assert bundle_two["cast_gallery_cards"][0]["episode_clusters"] == ["c2"]
+
+
+def test_bundle_includes_suggestions_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "demo-show-s01e05"
+    show_id = "DEMO-SHOW"
+    _write_run_artifacts(
+        ep_id,
+        RUN_ID,
+        identities=[{"identity_id": "c1", "track_ids": [1]}],
+        tracks=[{"track_id": 1, "faces_count": 2}],
+        faces=[{"track_id": 1, "frame_idx": 1}],
+    )
+    _write_people(
+        tmp_path,
+        show_id,
+        [
+            {
+                "person_id": "p_0001",
+                "name": "Person One",
+                "cast_id": "cast_1",
+                "cluster_ids": [f"{ep_id}:{RUN_ID}:c1"],
+            }
+        ],
+    )
+    _write_cast(tmp_path, show_id, [{"cast_id": "cast_1", "name": "Person One"}])
+
+    def _fake_suggestions(_: str, __: str) -> Dict[str, Any]:
+        return {
+            "status": "ready",
+            "suggestions": {"c1": [{"cast_id": "cast_1", "score": 0.92, "similarity": 0.92}]},
+            "triage": {"c1": {"triage_score": 1.0}},
+        }
+
+    monkeypatch.setattr(bundle_mod, "get_or_compute_suggestions", _fake_suggestions)
+
+    bundle = bundle_mod.build_faces_review_bundle(ep_id, RUN_ID, data_root=tmp_path)
+    suggestion = bundle["suggestions"]["suggestions"]["c1"][0]
+    assert suggestion["cast_id"] == "cast_1"
+    assert suggestion["name"] == "Person One"
 
 
 def test_bundle_includes_run_state_and_validation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
