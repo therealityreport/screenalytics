@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import redis
+try:
+    import redis
+except ImportError:  # pragma: no cover - optional dependency in tests
+    redis = None  # type: ignore[assignment]
 from celery import Task, states, group, chord
 from celery.result import AsyncResult, GroupResult
 
@@ -52,12 +55,14 @@ def _find_project_root() -> Path:
 PROJECT_ROOT = _find_project_root()
 
 # Redis client for job locking
-_redis_client: Optional[redis.Redis] = None
+_redis_client: Optional["redis.Redis"] = None
 
 
-def _get_redis() -> redis.Redis:
+def _get_redis() -> "redis.Redis":
     """Get or create Redis client for job locking."""
     global _redis_client
+    if redis is None:
+        raise RuntimeError("redis is required for background job coordination")
     if _redis_client is None:
         _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     return _redis_client

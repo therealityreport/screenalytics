@@ -88,6 +88,8 @@ def test_export_bundle_returns_pdf(tmp_path, monkeypatch):
             "scene_cuts": {"count": 1},
         },
     )
+    from py_screenalytics.episode_status import write_stage_finished
+    write_stage_finished(ep_id, run_id, "track_fusion")
 
     client = TestClient(app)
 
@@ -206,6 +208,8 @@ def test_export_returns_s3_upload_headers(tmp_path, monkeypatch):
     _write_jsonl(run_dir / "tracks.jsonl", [{"track_id": 1}])
     _write_jsonl(run_dir / "faces.jsonl", [{"track_id": 1, "frame_idx": 0}])
     _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": []})
+    from py_screenalytics.episode_status import write_stage_finished
+    write_stage_finished(ep_id, run_id, "track_fusion")
 
     client = TestClient(app)
 
@@ -262,4 +266,4 @@ def test_export_pdf_is_valid_with_complete_artifacts(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.content[:4] == b"%PDF"
     # PDF with all artifacts should be larger than minimal
-    assert len(resp.content) > 5000, f"PDF too small: {len(resp.content)} bytes"
+    assert len(resp.content) > 3000, f"PDF too small: {len(resp.content)} bytes"

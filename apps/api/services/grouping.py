@@ -2945,6 +2945,7 @@ class GroupingService:
         suggestions = []
         mismatched_embeddings: List[Dict[str, Any]] = []
 
+        single_track_clusters: set[str] = set()
         for cluster_id in clusters_needing_suggestions:
             centroid_data = centroids_map.get(cluster_id)
             if not centroid_data:
@@ -2955,6 +2956,8 @@ class GroupingService:
             cluster_face_embeddings: List[np.ndarray] = []
             for tid in cluster_track_ids:
                 cluster_face_embeddings.extend(unassigned_track_embeddings.get(int(tid), []))
+            if len(cluster_track_ids) == 1:
+                single_track_clusters.add(cluster_id)
 
             # Check for dimension mismatch before computing similarity
             centroid_dim = centroid_vec.shape[0]
@@ -2973,17 +2976,19 @@ class GroupingService:
                 })
                 continue  # Skip this cluster instead of crashing
 
-            use_frame_matching = len(cluster_track_ids) == 1 and len(cluster_face_embeddings) > 0
+            use_frame_matching = False
+            if cluster_id in single_track_clusters:
+                use_frame_matching = len(cluster_face_embeddings) > 0
 
             # Find best similarity per cast member
             cast_matches: List[Dict[str, Any]] = []
             for cast_id, cast_embeddings in all_embeddings_by_cast.items():
                 best_sim = -1.0
                 source = "episode" if cast_id in embeddings_by_cast else "facebank"
-                faces_used: int | None = None
+                n_faces_used: int | None = None
 
                 if use_frame_matching:
-                    faces_used = len(cluster_face_embeddings)
+                    n_faces_used = len(cluster_face_embeddings)
                     for face_emb in cluster_face_embeddings:
                         # Check face embedding dimension too
                         if face_emb.shape[0] != reference_dim:
@@ -3026,8 +3031,8 @@ class GroupingService:
                         "name": cast_name,
                         "similarity": round(float(best_sim), 3),
                         "confidence": confidence,
-                        "source": source,
-                        "faces_used": faces_used,
+                        "source": "frame" if use_frame_matching else source,
+                        "faces_used": n_faces_used,
                     })
 
             # Sort by similarity (descending) and take top_k

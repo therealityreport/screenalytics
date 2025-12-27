@@ -24,7 +24,7 @@ class TestVoiceClustering:
     def test_clusters_from_diarization_labels(self):
         """Clusters created from diarization labels without embeddings."""
         from py_screenalytics.audio.voice_clusters import _clusters_from_diarization_labels
-        from py_screanalytics.audio.models import DiarizationSegment
+        from py_screenalytics.audio.models import DiarizationSegment
 
         segments = [
             DiarizationSegment(start=0.0, end=5.0, speaker="SPEAKER_00"),
@@ -143,7 +143,7 @@ class TestVoiceClustering:
 
     def test_cluster_ids_sorted_by_duration(self):
         """Cluster IDs are assigned by descending duration."""
-        from py_screanalytics.audio.voice_clusters import _assign_cluster_ids
+        from py_screenalytics.audio.voice_clusters import _assign_cluster_ids
         from py_screenalytics.audio.models import VoiceCluster
 
         clusters = [
@@ -183,7 +183,7 @@ class TestVoiceClustering:
 
     def test_compute_cluster_centroid(self):
         """Centroid computation is normalized."""
-        from py_screanalytics.audio.voice_clusters import compute_cluster_centroid
+        from py_screenalytics.audio.voice_clusters import compute_cluster_centroid
 
         embeddings = [
             np.array([1.0, 0.0, 0.0]),
@@ -202,7 +202,7 @@ class TestVoiceClustering:
 
     def test_compute_cluster_centroid_median(self):
         """Median centroid is also normalized."""
-        from py_screanalytics.audio.voice_clusters import compute_cluster_centroid
+        from py_screenalytics.audio.voice_clusters import compute_cluster_centroid
 
         embeddings = [
             np.array([1.0, 0.0]),
@@ -219,11 +219,11 @@ class TestVoiceClustering:
 class TestVoiceClusteringIntegration:
     """Integration tests for voice clustering with mocked embeddings."""
 
-    @patch("py_screanalytics.audio.voice_clusters.extract_speaker_embeddings")
+    @patch("py_screenalytics.audio.diarization_nemo.extract_speaker_embeddings")
     def test_cluster_episode_voices_with_embeddings(self, mock_extract):
         """Clustering with embeddings merges similar speakers."""
         from py_screenalytics.audio.voice_clusters import cluster_episode_voices
-        from py_screanalytics.audio.models import DiarizationSegment, VoiceClusteringConfig
+        from py_screenalytics.audio.models import DiarizationSegment, VoiceClusteringConfig
 
         segments = [
             DiarizationSegment(start=0.0, end=5.0, speaker="SPEAKER_00"),

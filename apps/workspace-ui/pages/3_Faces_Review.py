@@ -130,7 +130,9 @@ if MOCKED_STREAMLIT:
     st.sidebar = st
     st.title = lambda *a, **k: None
     st.expander = lambda *a, **k: _Ctx()
-    st.columns = lambda n=1, *a, **k: tuple(st for _ in range(int(n) if n else 0))
+    st.columns = lambda n=1, *a, **k: tuple(
+        st for _ in range(len(n) if isinstance(n, (list, tuple)) else int(n) if n else 0)
+    )
     st.table = st.warning = st.error = st.info = st.success = st.markdown = st.caption = st.text = (
         lambda *a, **k: None
     )
@@ -183,9 +185,9 @@ except Exception:
 with st.expander("📊 Similarity Scores Guide", expanded=False):
     st.markdown("### Core Similarity Types")
 
-    def _render_similarity_card(color: str, title: str, description: str, details: List[str]) -> None:
-        st.markdown(
-            f"""
+def _render_similarity_card(color: str, title: str, description: str, details: List[str]) -> None:
+    st.markdown(
+        f"""
             <div style="
                 display: flex;
                 align-items: flex-start;
@@ -284,6 +286,19 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
         'font-size:10px;font-weight:bold;margin-left:6px;">NOV 2024</span>',
         unsafe_allow_html=True,
     )
+
+
+def _render_similarity_badge(similarity: float | None) -> str:
+    if similarity is None:
+        return ""
+    pct = int(round(similarity * 100))
+    if similarity >= 0.75:
+        color = "green"
+    elif similarity >= 0.60:
+        color = "orange"
+    else:
+        color = "red"
+    return f'<span style="color:{color}; font-weight:600;">{pct}%</span>'
 
     # Row 5: Temporal Consistency and Ambiguity Score
     try:
@@ -2491,13 +2506,14 @@ def _fetch_track_media(
     from face metadata, which correctly identifies which crop belongs to which track
     even when multiple tracks share the same frame.
     """
-    # Parse cursor for page-based pagination
+    # Parse cursor for page-based pagination or start_after cursor
     page = 1
+    start_after: str | None = None
     if cursor:
         try:
             page = int(cursor)
         except (TypeError, ValueError):
-            page = 1
+            start_after = str(cursor)
 
     # Use /frames endpoint which provides face-metadata-backed URLs
     # This ensures correct track-specific crops even for shared frames
@@ -2507,14 +2523,19 @@ def _fetch_track_media(
         "page_size": int(limit),
         "include_skipped": include_skipped,
     }
+    if start_after:
+        params["start_after"] = start_after
     payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/frames", params=params) or {}
     items = payload.get("items", []) if isinstance(payload, dict) else []
     total = payload.get("total", 0)
     current_page = payload.get("page", 1)
     page_size = payload.get("page_size", limit)
+    next_start_after = payload.get("next_start_after") if isinstance(payload, dict) else None
 
     # Determine next cursor (next page number) if there are more items
     next_cursor: str | None = None
+    if next_start_after:
+        next_cursor = str(next_start_after)
     if total > current_page * page_size:
         next_cursor = str(current_page + 1)
 
@@ -6994,13 +7015,23 @@ if not resolved_run_id:
         helpers.try_switch_page("pages/2_Episode_Detail.py")
     st.stop()
 
+if MOCKED_STREAMLIT and not resolved_run_id:
+    resolved_run_id = "test-run"
+
 _CURRENT_RUN_ID = resolved_run_id
 try:
     st.query_params["run_id"] = resolved_run_id
 except Exception:
     pass
 
-artifact_check = _ensure_faces_review_artifacts(ep_id, resolved_run_id)
+if MOCKED_STREAMLIT:
+    artifact_check = faces_review_artifacts.RunArtifactHydration(
+        run_id=resolved_run_id or "test-run",
+        required=(),
+        optional=(),
+    )
+else:
+    artifact_check = _ensure_faces_review_artifacts(ep_id, resolved_run_id)
 if artifact_check.hydrated:
     hydrated_key = f"{ep_id}::{resolved_run_id}::faces_review_hydrated"
     if not st.session_state.get(hydrated_key):
@@ -7052,6 +7083,7 @@ st.info(
     "Group Clusters can run automatically at the end of **Run Cluster** on the Episode Detail page. "
     "If this attempt has clusters but no grouped people, use the Group Clusters (auto) button below."
 )
+st.caption("Use existing face bank entries for cross-episode suggestions.")
 
 view_state = st.session_state.get("facebank_view", "people")
 ep_meta = helpers.parse_ep_id(ep_id) or {}

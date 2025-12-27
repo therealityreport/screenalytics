@@ -2650,7 +2650,7 @@ except Exception:
 _manifests_root = get_path(ep_id, "detections").parent
 _runs_root = _manifests_root / "runs"
 _scoped_manifests_dir = (
-    run_layout.run_root(ep_id, selected_attempt_run_id)
+    _runs_root / selected_attempt_run_id
     if selected_attempt_run_id
     else _manifests_root
 )
@@ -3241,17 +3241,17 @@ if not detect_status_authoritative:
         tracks_ready = True
         using_manifest_fallback = True
 
-    autorun_phase_hint = stage_layout.normalize_stage_key(st.session_state.get(_autorun_phase_key))
-    autorun_detect_pending = bool(st.session_state.get("episode_detail_detect_autorun_flag"))
-    if (
-        autorun_phase_hint == "detect"
-        and autorun_detect_pending
-        and detect_status_value in {"missing", "unknown", "stale"}
-    ):
-        detect_status_value = "running"
-
 if detect_status_authoritative and canonical_detect_status:
     detect_status_value = canonical_detect_status
+
+autorun_phase_hint = stage_layout.normalize_stage_key(st.session_state.get(_autorun_phase_key))
+autorun_detect_pending = bool(st.session_state.get("episode_detail_detect_autorun_flag"))
+if (
+    autorun_phase_hint == "detect"
+    and autorun_detect_pending
+    and detect_status_value in {"missing", "unknown", "stale"}
+):
+    detect_status_value = "running"
 
 if not cluster_status_authoritative and cluster_status_value in {"missing", "unknown"}:
     identities_count_manifest = None
@@ -3821,13 +3821,26 @@ with st.expander("Recent Attempts", expanded=False):
     if not recent_runs:
         st.caption("No previous attempts found.")
     else:
+        def _col_caption(col, text: str) -> None:
+            handler = getattr(col, "caption", None)
+            if callable(handler):
+                handler(text)
+            else:
+                st.caption(text)
+
+        def _col_checkbox(col, label: str, **kwargs: Any) -> bool:
+            handler = getattr(col, "checkbox", None)
+            if callable(handler):
+                return bool(handler(label, **kwargs))
+            return bool(st.checkbox(label, **kwargs))
+
         header_cols = st.columns([3, 4, 2, 1, 1, 1])
-        header_cols[0].caption("Run ID")
-        header_cols[1].caption("Completed stages")
-        header_cols[2].caption("Last update")
-        header_cols[3].caption("Select")
-        header_cols[4].caption("Confirm")
-        header_cols[5].caption("Delete")
+        _col_caption(header_cols[0], "Run ID")
+        _col_caption(header_cols[1], "Completed stages")
+        _col_caption(header_cols[2], "Last update")
+        _col_caption(header_cols[3], "Select")
+        _col_caption(header_cols[4], "Confirm")
+        _col_caption(header_cols[5], "Delete")
         for entry in recent_runs:
             run_id = entry["run_id"]
             run_root = run_layout.run_root(ep_id, run_id)
@@ -3845,8 +3858,8 @@ with st.expander("Recent Attempts", expanded=False):
             updated_label = _format_timestamp(updated_iso) or "—"
             row_cols = st.columns([3, 4, 2, 1, 1, 1])
             row_cols[0].code(run_id)
-            row_cols[1].caption(entry["completed"])
-            row_cols[2].caption(updated_label)
+            _col_caption(row_cols[1], entry["completed"])
+            _col_caption(row_cols[2], updated_label)
             if row_cols[3].button(
                 "Select",
                 key=f"{ep_id}::select_recent_attempt::{run_id}",
@@ -3856,7 +3869,8 @@ with st.expander("Recent Attempts", expanded=False):
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
             confirm_key = f"{ep_id}::confirm_delete_attempt::{run_id}"
-            confirm_delete = row_cols[4].checkbox(
+            confirm_delete = _col_checkbox(
+                row_cols[4],
                 "Confirm",
                 key=confirm_key,
                 label_visibility="collapsed",
@@ -4177,8 +4191,7 @@ with col1:
     if device_label:
         detect_params.append(f"device={device_label}")
     if (
-        not detect_status_authoritative
-        and detect_status_value in {"missing", "unknown", "stale"}
+        detect_status_value in {"missing", "unknown", "stale"}
         and detections_path.exists()
         and tracks_path.exists()
     ):
@@ -5836,6 +5849,16 @@ def _autorun_drive_downstream(run_id: str) -> None:
         if not track_fusion_enabled:
             _autorun_stop("Track Fusion", "disabled_by_config")
             return
+        if body_fusion_marker_payload and body_fusion_legacy_available:
+            marker_status = str(body_fusion_marker_payload.get("status") or "").strip().lower()
+            if marker_status == "success":
+                stage_label = "Track Fusion (legacy)"
+                if fusion_mode_label:
+                    stage_label = f"{stage_label} ({fusion_mode_label})"
+                _autorun_append_completed(stage_label)
+                st.session_state[_autorun_phase_key] = "pdf"
+                st.toast("⚠️ Track Fusion complete (legacy artifacts).")
+                st.rerun()
         if body_fusion_status_value == "stale" and body_fusion_legacy_available:
             stage_label = "Track Fusion (legacy)"
             if fusion_mode_label:
@@ -8132,11 +8155,24 @@ _execution_mode = helpers.get_execution_mode(ep_id)
 
 auto_refresh_logs = False
 if status_running and not st_autorefresh:
-    auto_refresh_logs = st.toggle(
-        "Auto-refresh logs",
-        value=_execution_mode != "local",
-        key=f"{ep_id}::run_logs_autorefresh_toggle",
-    )
+    toggle_fn = getattr(st, "toggle", None)
+    toggle_key = f"{ep_id}::run_logs_autorefresh_toggle"
+    if callable(toggle_fn):
+        auto_refresh_logs = bool(
+            toggle_fn(
+                "Auto-refresh logs",
+                value=_execution_mode != "local",
+                key=toggle_key,
+            )
+        )
+    else:
+        auto_refresh_logs = bool(
+            st.checkbox(
+                "Auto-refresh logs",
+                value=_execution_mode != "local",
+                key=toggle_key,
+            )
+        )
     if _execution_mode == "local":
         st.caption("Auto-refresh disabled in local mode; logs stream without refresh.")
     else:

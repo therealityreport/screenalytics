@@ -264,6 +264,10 @@ class TestGroupingExecutionMode:
             "apps.api.routers.grouping.grouping_service.batch_assign_clusters",
             fake_batch_assign,
         )
+        monkeypatch.setattr(
+            "apps.api.routers.grouping.cast_service.get_cast_member",
+            lambda show_id, cast_id: {"cast_id": cast_id},
+        )
 
         payload = {
             "assignments": [{"cluster_id": "c1", "target_cast_id": "person1"}],
@@ -279,7 +283,7 @@ class TestGroupingExecutionMode:
     def test_group_clusters_async_local_mode(self, api_client, monkeypatch):
         """POST /episodes/{ep_id}/clusters/group_async with local mode."""
         # Mock grouping service
-        def fake_group_auto(ep_id, progress_callback=None, protect_manual=True, facebank_first=True):
+        def fake_group_auto(ep_id, progress_callback=None, protect_manual=True, facebank_first=True, **_):
             if progress_callback:
                 progress_callback("grouping", 1.0, "Done")
             return {"merged": 5, "total": 10}

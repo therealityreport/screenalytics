@@ -18,3 +18,4 @@ line-length = 120
 markers = [
     "slow: marks tests as slow (require face-alignment, TensorRT, or PyCUDA)",
 ]
+addopts = ["--import-mode=importlib"]

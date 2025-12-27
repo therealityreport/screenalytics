@@ -1617,6 +1617,9 @@ def _run_local_subprocess_blocking(
             "ep_id": episode_id,
             "operation": operation,
             "execution_mode": "local",
+            "device": options.get("device", "auto"),
+            "profile": options.get("profile", "default"),
+            "cpu_threads": min(int(options.get("cpu_threads") or 2), 2),
             "error": f"A {operation} job is already running for this episode (PID {existing_pid}). "
                      "Wait for it to complete or kill it manually.",
             "logs": [f"Existing job PID: {existing_pid}"],
@@ -1639,11 +1642,9 @@ def _run_local_subprocess_blocking(
     LOGGER.info(f"[{episode_id}] Starting local {operation} (device={device}, stride={stride}, threads={cpu_threads})")
     LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
 
-    # Set up environment with CPU thread limits based on profile
-    # Profile caps: low_power=2, balanced=4, performance=8
+    # Set up environment with CPU thread limits based on local-mode hard cap
     env = os.environ.copy()
-    profile_thread_cap = PROFILE_THREAD_CAPS.get(profile, 4)
-    local_max_threads = min(int(cpu_threads or profile_thread_cap), profile_thread_cap)
+    local_max_threads = min(int(cpu_threads or 2), 2)
     env.update({
         "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
         "OMP_NUM_THREADS": str(local_max_threads),
@@ -1656,7 +1657,7 @@ def _run_local_subprocess_blocking(
         # Enable local mode instrumentation for verbose phase-level logging
         "LOCAL_MODE_INSTRUMENTATION": "1",
     })
-    logs.append(f"Local mode: CPU threads = {local_max_threads} (profile={profile})")
+    logs.append(f"Local mode: CPU threads capped at {local_max_threads} (profile={profile})")
     LOGGER.info(f"[{episode_id}] Local mode CPU threads capped at {local_max_threads}")
 
     # Apply thermal limiting wrapper for thermal safety
@@ -1727,6 +1728,9 @@ def _run_local_subprocess_blocking(
                 "ep_id": episode_id,
                 "operation": operation,
                 "execution_mode": "local",
+                "device": device,
+                "profile": profile,
+                "cpu_threads": local_max_threads,
                 "error": f"Job timed out after {timeout} seconds",
                 "logs": logs,
                 "elapsed_seconds": elapsed,
@@ -1750,6 +1754,9 @@ def _run_local_subprocess_blocking(
                 "ep_id": episode_id,
                 "operation": operation,
                 "execution_mode": "local",
+                "device": device,
+                "profile": profile,
+                "cpu_threads": local_max_threads,
                 "error": error_msg,
                 "return_code": process.returncode,
                 "logs": logs,
@@ -1770,6 +1777,9 @@ def _run_local_subprocess_blocking(
             "ep_id": episode_id,
             "operation": operation,
             "execution_mode": "local",
+            "device": device,
+            "profile": profile,
+            "cpu_threads": local_max_threads,
             "return_code": 0,
             "logs": logs,
             "elapsed_seconds": elapsed,
@@ -1788,6 +1798,9 @@ def _run_local_subprocess_blocking(
             "ep_id": episode_id,
             "operation": operation,
             "execution_mode": "local",
+            "device": device,
+            "profile": profile,
+            "cpu_threads": local_max_threads,
             "error": error_msg,
             "logs": logs,
             "elapsed_seconds": elapsed,
@@ -2964,7 +2977,10 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest, request: Requ
                 media_type="application/x-ndjson",
                 headers=headers,
             )
-        return _run_local_subprocess_blocking(command, req.ep_id, "detect_track", options)
+        result = _run_local_subprocess_blocking(command, req.ep_id, "detect_track", options)
+        if result.get("status") == "error":
+            return JSONResponse(status_code=500, content=result)
+        return result
     params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
     response = _enqueue_run_stage_job(
         ep_id=req.ep_id,
@@ -2994,7 +3010,10 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest, request: Reques
                 media_type="application/x-ndjson",
                 headers=headers,
             )
-        return _run_local_subprocess_blocking(command, req.ep_id, "faces_embed", options)
+        result = _run_local_subprocess_blocking(command, req.ep_id, "faces_embed", options)
+        if result.get("status") == "error":
+            return JSONResponse(status_code=500, content=result)
+        return result
     params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
     response = _enqueue_run_stage_job(
         ep_id=req.ep_id,
@@ -3024,7 +3043,10 @@ async def start_cluster_celery(req: ClusterCeleryRequest, request: Request):
                 media_type="application/x-ndjson",
                 headers=headers,
             )
-        return _run_local_subprocess_blocking(command, req.ep_id, "cluster", options)
+        result = _run_local_subprocess_blocking(command, req.ep_id, "cluster", options)
+        if result.get("status") == "error":
+            return JSONResponse(status_code=500, content=result)
+        return result
     params = req.model_dump(exclude={"ep_id", "run_id", "execution_mode"}, exclude_none=True)
     response = _enqueue_run_stage_job(
         ep_id=req.ep_id,

@@ -198,6 +198,45 @@ STAGE_HEARTBEAT_INTERVAL = float(
 TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+
+
+def _embedding_is_valid(embedding: Any, expected_dim: int = 512) -> bool:
+    if embedding is None:
+        return False
+    if not isinstance(embedding, np.ndarray):
+        return False
+    if embedding.ndim != 1:
+        return False
+    if embedding.shape[0] != expected_dim:
+        return False
+    if not np.isfinite(embedding).all():
+        return False
+    norm = float(np.linalg.norm(embedding))
+    if norm < 0.9 or norm > 1.1:
+        return False
+    return True
+
+
+def _analyze_pose_expression(_landmarks: Any) -> tuple[None, None, None]:
+    return None, None, None
+
+
+def _parse_track_id(raw: Any) -> int:
+    if raw is None:
+        raise ValueError("Cannot parse track_id")
+    if not isinstance(raw, (int, str)):
+        raise ValueError("Cannot parse track_id")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value.isdigit():
+            return int(value)
+        if value.lower().startswith("track-"):
+            suffix = value.split("-", 1)[1]
+            if suffix.isdigit():
+                return int(suffix)
+    raise ValueError(f"Invalid track ID: {raw!r}")
 DETECTOR_CHOICES = ("retinaface",)
 DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
 TRACKER_CHOICES = ("bytetrack", "strongsort")
@@ -1246,6 +1285,158 @@ def _cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float | No
     if denom <= 0.0:
         return None
     return float(np.dot(a, b) / denom)
+
+
+_CLUSTERING_CONFIG_EARLY: dict[str, Any] = {
+    "singleton_merge": {
+        "enabled": False,
+        "trigger_singleton_frac": 0.6,
+        "secondary_cluster_thresh": 0.7,
+        "max_pairs_per_track": 5,
+        "min_tracks_per_merged_cluster": 2,
+        "max_singleton_merge_iters": 1,
+    }
+}
+
+
+def _apply_singleton_merge(
+    groups: list[list[int]],
+    embeddings: dict[int, np.ndarray],
+    *,
+    primary_cluster_thresh: float,
+    min_cluster_size: int,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    config = (_CLUSTERING_CONFIG_EARLY or {}).get("singleton_merge", {})
+    enabled = bool(config.get("enabled", False))
+    singleton_groups = [group for group in groups if len(group) == 1]
+    total_groups = len(groups)
+    singleton_fraction = len(singleton_groups) / total_groups if total_groups > 0 else 0.0
+    summary = {
+        "enabled": enabled,
+        "applied": False,
+        "singleton_fraction_before": singleton_fraction,
+        "singleton_fraction_after": singleton_fraction,
+        "neighbor_top_k": int(config.get("max_pairs_per_track", 0)),
+        "similarity_thresh": float(config.get("secondary_cluster_thresh", primary_cluster_thresh)),
+        "merge_count": 0,
+    }
+
+    if not enabled or total_groups == 0 or len(singleton_groups) < 2:
+        return groups, summary
+
+    trigger_frac = float(config.get("trigger_singleton_frac", 1.0))
+    if singleton_fraction < trigger_frac:
+        return groups, summary
+
+    summary["applied"] = True
+
+    similarity_thresh = summary["similarity_thresh"]
+    neighbor_top_k = summary["neighbor_top_k"]
+    min_tracks = int(config.get("min_tracks_per_merged_cluster", min_cluster_size))
+
+    singleton_track_ids = [group[0] for group in singleton_groups if group]
+    similarity_map: dict[int, list[tuple[int, float]]] = {tid: [] for tid in singleton_track_ids}
+
+    for idx, tid in enumerate(singleton_track_ids):
+        emb = embeddings.get(tid)
+        if emb is None:
+            continue
+        for other in singleton_track_ids[idx + 1 :]:
+            other_emb = embeddings.get(other)
+            if other_emb is None:
+                continue
+            sim = _cosine_similarity(emb, other_emb)
+            if sim is None:
+                continue
+            similarity_map[tid].append((other, sim))
+            similarity_map[other].append((tid, sim))
+
+    adjacency: dict[int, set[int]] = {tid: set() for tid in singleton_track_ids}
+    for tid, sims in similarity_map.items():
+        sims.sort(key=lambda entry: entry[1], reverse=True)
+        for other, sim in sims[:neighbor_top_k]:
+            if sim < similarity_thresh:
+                continue
+            adjacency[tid].add(other)
+            adjacency[other].add(tid)
+
+    visited: set[int] = set()
+    merged_components: list[list[int]] = []
+    for tid in singleton_track_ids:
+        if tid in visited:
+            continue
+        stack = [tid]
+        component: list[int] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(adjacency.get(current, set()) - visited)
+        merged_components.append(component)
+
+    merged_groups: list[list[int]] = [group for group in groups if len(group) >= max(min_cluster_size, 2)]
+    merge_count = 0
+    for component in merged_components:
+        if len(component) >= max(min_tracks, 2):
+            merge_count += 1
+            merged_groups.append(sorted(component))
+        else:
+            for track_id in component:
+                merged_groups.append([track_id])
+
+    new_singletons = sum(1 for group in merged_groups if len(group) == 1)
+    summary["singleton_fraction_after"] = new_singletons / len(merged_groups) if merged_groups else 0.0
+    summary["merge_count"] = merge_count
+
+    return merged_groups, summary
+
+
+def _emit_singleton_guardrail(
+    singleton_stats: dict[str, Any],
+    *,
+    cluster_thresholds: dict[str, Any],
+    merge_summary: dict[str, Any],
+    cluster_thresh: float,
+) -> None:
+    enabled = bool(singleton_stats.get("enabled", False))
+    before = float(singleton_stats.get("before", {}).get("singleton_fraction", 0.0))
+    after = float(singleton_stats.get("after", {}).get("singleton_fraction", before))
+    max_singleton_frac = float(cluster_thresholds.get("max_singleton_fraction", 1.0))
+
+    if not enabled:
+        if before > max_singleton_frac:
+            LOGGER.warning(
+                "[GUARDRAIL] High singleton fraction %.3f (max %.3f) with merge disabled",
+                before,
+                max_singleton_frac,
+            )
+        return
+
+    if before > max_singleton_frac and after <= max_singleton_frac:
+        LOGGER.info(
+            "Singleton merge improved singleton_fraction %.3f -> %.3f (cluster_thresh=%.3f)",
+            before,
+            after,
+            cluster_thresh,
+        )
+        return
+
+    if after > max_singleton_frac:
+        LOGGER.warning(
+            "[GUARDRAIL] High singleton fraction after singleton merge %.3f (max %.3f)",
+            after,
+            max_singleton_frac,
+        )
+        return
+
+    LOGGER.info(
+        "Singleton merge completed (before=%.3f after=%.3f thresh=%.3f)",
+        before,
+        after,
+        cluster_thresh,
+    )
 
 
 class AppearanceGate:
@@ -2564,9 +2755,8 @@ def _prepare_face_crop(
     import numpy as _np
 
     normalized_mode = (detector_mode or "retinaface").lower()
-    # For simulated detector, use the bbox it computed (centered on brightest pixels)
-    # instead of letterboxing the full image. This preserves the useful crop.
-    # Fall through to bbox-based cropping logic below.
+    if normalized_mode == "simulated":
+        return _letterbox_square(image, size=112), None
 
     if align and landmarks and len(landmarks) >= 10 and normalized_mode != "simulated":
         pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
@@ -3167,10 +3357,13 @@ class ThumbWriter:
                 return None, None
         else:
             # Local/hybrid mode: write directly to disk
-            ok, reason = safe_imwrite(
-                abs_path, thumb, self.jpeg_quality,
-                use_png=self.use_png, png_compression=self.png_compression
-            )
+            try:
+                ok, reason = safe_imwrite(
+                    abs_path, thumb, self.jpeg_quality,
+                    use_png=self.use_png, png_compression=self.png_compression
+                )
+            except TypeError:
+                ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
             if not ok:
                 LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
                 return None, None
@@ -3901,7 +4094,9 @@ class FrameExporter:
         jpeg_quality: int,
         debug_logger: JsonlLogger | NullLogger | None = None,
         storage_backend=None,
-        use_png: bool = True,  # Default to PNG for maximum quality
+        storage=None,
+        s3_prefixes: dict[str, str] | None = None,
+        use_png: bool = False,  # Default to JPEG for compatibility
         png_compression: int = 3,  # PNG compression (0-9)
     ) -> None:
         self.ep_id = ep_id
@@ -3913,13 +4108,21 @@ class FrameExporter:
         self.root_dir = _frames_root_for_run(ep_id, run_id)
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
-        self._storage_backend = storage_backend
+        self._storage_backend = storage_backend or storage
+        self._legacy_storage = storage_backend is None and storage is not None
+        self._s3_prefixes = dict(s3_prefixes or {})
         # Determine if we should use backend for writes (only for pure S3 mode)
-        self._use_backend_writes = (
-            storage_backend is not None
-            and hasattr(storage_backend, "backend_type")
-            and storage_backend.backend_type == "s3"
-        )
+        if self._legacy_storage:
+            try:
+                self._use_backend_writes = bool(self._storage_backend and self._storage_backend.s3_enabled())
+            except Exception:
+                self._use_backend_writes = False
+        else:
+            self._use_backend_writes = (
+                self._storage_backend is not None
+                and hasattr(self._storage_backend, "backend_type")
+                and self._storage_backend.backend_type == "s3"
+            )
         # For local/hybrid modes, still create local directories
         if not self._use_backend_writes:
             if self.save_frames:
@@ -3976,15 +4179,29 @@ class FrameExporter:
                         img_data = encode_png_bytes(image, compression=self.png_compression, color="bgr")
                     else:
                         img_data = encode_jpeg_bytes(image, quality=self.jpeg_quality, color="bgr")
-                    result = self._storage_backend.write_frame(
-                        self.ep_id, frame_idx, img_data,
-                        content_type="image/png" if self.use_png else "image/jpeg",
-                    )
-                    if result.success:
-                        self.frames_written += 1
-                        self.bytes_written += len(img_data)
+                    if self._legacy_storage:
+                        frame_prefix = self._s3_prefixes.get("frames", "")
+                        key = f"{frame_prefix}frame_{frame_idx:06d}{ext}"
+                        ok = self._storage_backend.upload_bytes(
+                            img_data,
+                            key,
+                            content_type="image/png" if self.use_png else "image/jpeg",
+                        )
+                        if ok:
+                            self.frames_written += 1
+                            self.bytes_written += len(img_data)
+                        else:
+                            LOGGER.warning("Failed to upload frame %d to %s", frame_idx, key)
                     else:
-                        LOGGER.warning("Failed to upload frame %d: %s", frame_idx, result.error)
+                        result = self._storage_backend.write_frame(
+                            self.ep_id, frame_idx, img_data,
+                            content_type="image/png" if self.use_png else "image/jpeg",
+                        )
+                        if result.success:
+                            self.frames_written += 1
+                            self.bytes_written += len(img_data)
+                        else:
+                            LOGGER.warning("Failed to upload frame %d: %s", frame_idx, result.error)
                 else:
                     # Local/hybrid mode: write directly to disk
                     if self.use_png:
@@ -4042,6 +4259,19 @@ class FrameExporter:
 
     def write_indexes(self) -> None:
         if not self.save_crops or not self._track_indexes:
+            return
+        if self._use_backend_writes and self._legacy_storage and self._storage_backend is not None:
+            crop_prefix = self._s3_prefixes.get("crops", "")
+            for track_id, entries in self._track_indexes.items():
+                if not entries:
+                    continue
+                ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
+                key = f"{crop_prefix}track_{track_id:04d}/index.json"
+                try:
+                    payload = json.dumps(ordered, indent=2).encode("utf-8")
+                    self._storage_backend.upload_bytes(payload, key, content_type="application/json")
+                except Exception as exc:  # pragma: no cover - best effort
+                    LOGGER.warning("Failed to upload crop index %s: %s", key, exc)
             return
         for track_id, entries in self._track_indexes.items():
             if not entries:
@@ -4131,13 +4361,25 @@ class FrameExporter:
                     img_data = encode_png_bytes(crop, compression=self.png_compression, color="bgr")
                 else:
                     img_data = encode_jpeg_bytes(crop, quality=self.jpeg_quality, color="bgr")
-                result = self._storage_backend.write_crop(
-                    self.ep_id, track_id, frame_idx, img_data,
-                    content_type="image/png" if self.use_png else "image/jpeg",
-                )
-                ok = result.success
-                save_err = result.error if not ok else None
-                file_size = len(img_data) if ok else None
+                if self._legacy_storage:
+                    crop_prefix = self._s3_prefixes.get("crops", "")
+                    ext = ".png" if self.use_png else ".jpg"
+                    key = f"{crop_prefix}track_{track_id:04d}/frame_{frame_idx:06d}{ext}"
+                    ok = self._storage_backend.upload_bytes(
+                        img_data,
+                        key,
+                        content_type="image/png" if self.use_png else "image/jpeg",
+                    )
+                    save_err = None if ok else "upload_failed"
+                    file_size = len(img_data) if ok else None
+                else:
+                    result = self._storage_backend.write_crop(
+                        self.ep_id, track_id, frame_idx, img_data,
+                        content_type="image/png" if self.use_png else "image/jpeg",
+                    )
+                    ok = result.success
+                    save_err = result.error if not ok else None
+                    file_size = len(img_data) if ok else None
                 if ok:
                     self.bytes_written += len(img_data)
             except Exception as exc:
@@ -5855,6 +6097,35 @@ def detect_scene_cuts_pyscenedetect(
     return [start.get_frames() for (start, _end) in scenes if start.get_frames() > 0]
 
 
+def _opencv_has_ffmpeg() -> bool:
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return False
+    try:
+        info = cv2.getBuildInformation()
+    except Exception:
+        return False
+    for token in ("FFMPEG: YES", "FFMPEG=YES"):
+        if token in info:
+            return True
+    return False
+
+
+def _opencv_can_open(video_path: str | Path) -> bool:
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return False
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        ok = bool(cap.isOpened())
+        cap.release()
+        return ok
+    except Exception:
+        return False
+
+
 def detect_scene_cuts(
     video_path: str | Path,
     *,
@@ -5866,6 +6137,10 @@ def detect_scene_cuts(
     """Run the configured scene-cut detector and emit consistent progress events."""
 
     detector_choice = _normalize_scene_detector_choice(detector)
+    detector_requested = detector_choice
+    detector_resolved = detector_choice
+    scene_mode_resolved = detector_choice
+    decode_backend = "opencv"
     threshold_value = max(float(thr), 0.0)
     if detector_choice == "internal":
         threshold_value = max(min(threshold_value, 2.0), 0.0)
@@ -5873,6 +6148,10 @@ def detect_scene_cuts(
         "detector": detector_choice,
         "threshold": round(float(threshold_value), 3),
         "min_len": max(int(min_len), 1),
+        "detector_requested": detector_requested,
+        "detector_resolved": detector_resolved,
+        "scene_mode_resolved": scene_mode_resolved,
+        "decode_backend": decode_backend,
     }
     if progress:
         progress.emit(
@@ -5883,14 +6162,30 @@ def detect_scene_cuts(
             force=True,
         )
 
+    if detector_choice == "pyscenedetect":
+        if not _opencv_can_open(video_path) or not _opencv_has_ffmpeg():
+            detector_choice = "internal"
+            detector_resolved = "internal"
+            scene_mode_resolved = "internal"
     if detector_choice == "off":
         cuts: list[int] = []
     elif detector_choice == "pyscenedetect":
-        cuts = detect_scene_cuts_pyscenedetect(
-            video_path,
-            threshold=threshold_value,
-            min_len=min_len,
-        )
+        try:
+            cuts = detect_scene_cuts_pyscenedetect(
+                video_path,
+                threshold=threshold_value,
+                min_len=min_len,
+            )
+        except Exception:
+            detector_choice = "internal"
+            detector_resolved = "internal"
+            scene_mode_resolved = "internal"
+            cuts = _detect_scene_cuts_histogram(
+                video_path,
+                thr=threshold_value,
+                min_len=min_len,
+                progress=progress,
+            )
     else:
         cuts = _detect_scene_cuts_histogram(
             video_path,
@@ -5901,7 +6196,14 @@ def detect_scene_cuts(
 
     if progress:
         total_frames = progress.target_frames or (cuts[-1] if cuts else 0)
-        summary_done = {"count": len(cuts), "detector": detector_choice}
+        summary_done = {
+            "count": len(cuts),
+            "detector": detector_choice,
+            "detector_requested": detector_requested,
+            "detector_resolved": detector_resolved,
+            "scene_mode_resolved": scene_mode_resolved,
+            "decode_backend": decode_backend,
+        }
         if cuts:
             summary_done["first_cut"] = cuts[0]
         progress.emit(
@@ -11476,6 +11778,7 @@ def _load_track_samples(
     max_samples_per_track: int | None = None,
     min_samples_per_track: int | None = None,
     sample_every_n_frames: int | None = None,
+    max_faces_total: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Load track samples from tracks.jsonl with optional per-track sampling.
 
@@ -11551,6 +11854,34 @@ def _load_track_samples(
 
     if sort_by_frame:
         samples.sort(key=lambda s: s["frame_idx"])
+
+    if max_faces_total is not None and max_faces_total > 0 and len(samples) > max_faces_total:
+        by_track: Dict[int, List[Dict[str, Any]]] = {}
+        for sample in samples:
+            by_track.setdefault(int(sample["track_id"]), []).append(sample)
+        for track_samples in by_track.values():
+            track_samples.sort(key=lambda s: s["frame_idx"])
+
+        track_ids = sorted(by_track.keys())
+        downsampled: List[Dict[str, Any]] = []
+        for track_id in track_ids:
+            if by_track[track_id]:
+                downsampled.append(by_track[track_id].pop(0))
+
+        remaining = max_faces_total - len(downsampled)
+        while remaining > 0:
+            progress = False
+            for track_id in track_ids:
+                if remaining <= 0:
+                    break
+                if by_track[track_id]:
+                    downsampled.append(by_track[track_id].pop(0))
+                    remaining -= 1
+                    progress = True
+            if not progress:
+                break
+
+        samples = downsampled
 
     return samples
 

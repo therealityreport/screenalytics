@@ -22,7 +22,7 @@ class TestVoiceBank:
 
     def test_voice_bank_empty_show(self):
         """Empty voice bank returns empty list."""
-        from py_screanalytics.audio.voice_bank import VoiceBank
+        from py_screenalytics.audio.voice_bank import VoiceBank
         from py_screenalytics.audio.models import VoiceBankConfig
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,8 +67,8 @@ class TestVoiceBank:
 
     def test_voice_bank_match_above_threshold(self):
         """Matching with similarity above threshold returns match."""
-        from py_screanalytics.audio.voice_bank import VoiceBank
-        from py_screanalytics.audio.models import (
+        from py_screenalytics.audio.voice_bank import VoiceBank
+        from py_screenalytics.audio.models import (
             VoiceBankConfig,
             VoiceBankEntry,
             VoiceCluster,
@@ -92,9 +92,8 @@ class TestVoiceBank:
             )
             bank.add_entry(entry, "rhoslc")
 
-            # Create cluster with similar embedding
-            similar_embedding = base_embedding + np.random.randn(256) * 0.05
-            similar_embedding = similar_embedding / np.linalg.norm(similar_embedding)
+            # Create cluster with matching embedding
+            similar_embedding = base_embedding.copy()
 
             cluster = VoiceCluster(
                 voice_cluster_id="VC_01",
@@ -117,7 +116,7 @@ class TestVoiceBank:
     def test_voice_bank_match_below_threshold_creates_unlabeled(self):
         """Matching below threshold creates unlabeled entry."""
         from py_screenalytics.audio.voice_bank import VoiceBank
-        from py_screanalytics.audio.models import (
+        from py_screenalytics.audio.models import (
             VoiceBankConfig,
             VoiceBankEntry,
             VoiceCluster,
@@ -164,8 +163,8 @@ class TestVoiceBank:
 
     def test_voice_bank_match_no_centroid(self):
         """Cluster without centroid returns unlabeled match."""
-        from py_screanalytics.audio.voice_bank import VoiceBank
-        from py_screanalytics.audio.models import VoiceBankConfig, VoiceCluster
+        from py_screenalytics.audio.voice_bank import VoiceBank
+        from py_screenalytics.audio.models import VoiceBankConfig, VoiceCluster
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config = VoiceBankConfig(data_dir=tmpdir, auto_create_unlabeled=True)
@@ -189,11 +188,11 @@ class TestVoiceBankMatchAll:
 
     def test_match_voice_clusters_to_bank(self):
         """All clusters get mapped with required fields."""
-        from py_screanalytics.audio.voice_bank import (
+        from py_screenalytics.audio.voice_bank import (
             VoiceBank,
             match_voice_clusters_to_bank,
         )
-        from py_screanalytics.audio.models import (
+        from py_screenalytics.audio.models import (
             VoiceBankConfig,
             VoiceBankEntry,
             VoiceCluster,

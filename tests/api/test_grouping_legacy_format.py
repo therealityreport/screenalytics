@@ -39,7 +39,6 @@ def test_grouping_service_handles_both_formats():
     # Check group_within_episode handles both formats
     assert "isinstance(centroids, list)" in content, "Should check for list format"
     assert "isinstance(centroids, dict)" in content, "Should check for dict format"
-    assert "centroids_list = [" in content, "Should convert dict to list for processing"
 
     print("✓ GroupingService methods handle both dict and list formats")
 

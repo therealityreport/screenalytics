@@ -282,6 +282,7 @@ class ScreenTimeAnalyzer:
 
         # Store merged intervals for timeline visualization
         cast_merged_intervals: Dict[str, List[Tuple[float, float]]] = {}
+        cast_interval_stats: Dict[str, Dict[str, float]] = {}
 
         # Merge intervals per cast member and compute durations
         for cast_id, metrics in cast_metrics_map.items():
@@ -297,6 +298,10 @@ class ScreenTimeAnalyzer:
             merged_duration = sum(self._interval_duration(interval) for interval in merged)
             metrics.visual_s = merged_duration
             cast_merged_intervals[cast_id] = merged
+            cast_interval_stats[cast_id] = {
+                "raw_s": raw_duration,
+                "merged_s": merged_duration,
+            }
 
             if LOGGER.isEnabledFor(logging.DEBUG):
                 LOGGER.debug(
@@ -430,6 +435,21 @@ class ScreenTimeAnalyzer:
             }
             metrics_list.append(metric_entry)
 
+        cast_sum_time_s = sum(m.visual_s for m in cast_metrics_map.values())
+        all_intervals = [interval for intervals in cast_merged_intervals.values() for interval in intervals]
+        union_intervals = self._merge_intervals(all_intervals) if all_intervals else []
+        cast_union_coverage_s = sum(self._interval_duration(interval) for interval in union_intervals)
+        multi_cast_overlap_s = max(0.0, cast_sum_time_s - cast_union_coverage_s)
+
+        self_overlap_top_casts: List[Dict[str, Any]] = []
+        for cast_id, stats in cast_interval_stats.items():
+            raw_s = stats.get("raw_s", 0.0)
+            merged_s = stats.get("merged_s", 0.0)
+            overlap = raw_s - merged_s
+            if overlap > 0:
+                self_overlap_top_casts.append({"cast_id": cast_id, "self_overlap_s": overlap})
+        self_overlap_top_casts.sort(key=lambda entry: entry["self_overlap_s"], reverse=True)
+
         return {
             "episode_id": ep_id,
             "run_id": run_id_norm,
@@ -438,6 +458,12 @@ class ScreenTimeAnalyzer:
             "metadata": {
                 "body_tracking_enabled": body_tracking_enabled,
                 "body_metrics_available": body_tracking_enabled and len(identity_to_body_metrics) > 0,
+            },
+            "math": {
+                "cast_union_coverage_s": cast_union_coverage_s,
+                "cast_sum_time_s": cast_sum_time_s,
+                "multi_cast_overlap_s": multi_cast_overlap_s,
+                "self_overlap_top_casts": self_overlap_top_casts,
             },
             "metrics": metrics_list,
             "timeline": timeline_data,

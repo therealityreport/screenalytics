@@ -139,7 +139,7 @@ class TestAsyncEndpoints:
 
         response = api_client.post("/episodes/test-s01e01/refresh_similarity_async")
         # Should return a response indicating async is unavailable
-        assert response.status_code == 200
+        assert response.status_code == 202
         data = response.json()
         assert data.get("async") is False
 
@@ -151,7 +151,7 @@ class TestAsyncEndpoints:
             json={"strategy": "manual", "cluster_ids": ["c1"]}
         )
         assert response.status_code == 400
-        assert "auto" in response.json()["detail"].lower()
+        assert "auto" in response.json()["message"].lower()
 
     def test_batch_assign_async_validation(self, api_client):
         """POST /episodes/{ep_id}/clusters/batch_assign_async requires assignments."""
@@ -160,7 +160,7 @@ class TestAsyncEndpoints:
             json={"assignments": []}
         )
         assert response.status_code == 400
-        assert "No assignments" in response.json()["detail"]
+        assert "No assignments" in response.json()["message"]
 
 
 class TestJobTaskHelpers:
@@ -450,7 +450,7 @@ class TestOperationLogsEndpoint:
         """GET /celery_jobs/logs/{ep_id}/{operation} returns 400 for invalid operation."""
         response = api_client.get("/celery_jobs/logs/some-ep/invalid_operation")
         assert response.status_code == 400
-        assert "Invalid operation" in response.json()["detail"]
+        assert "Invalid operation" in response.json()["message"]
 
     def test_get_logs_valid_operations(self, api_client):
         """GET /celery_jobs/logs/{ep_id}/{operation} accepts valid operations."""

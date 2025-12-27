@@ -24,7 +24,7 @@ def test_onnx_providers_auto_selects_cuda_when_available():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         assert providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "cuda"
@@ -43,7 +43,7 @@ def test_onnx_providers_auto_selects_coreml_when_cuda_unavailable():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "coreml"
@@ -58,7 +58,7 @@ def test_onnx_providers_auto_fallback_to_cpu():
     mock_ort.get_available_providers.return_value = ["CPUExecutionProvider"]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         assert providers == ["CPUExecutionProvider"]
         assert resolved == "cpu"
@@ -75,7 +75,7 @@ def test_onnx_providers_explicit_cuda_request():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("cuda")
+        providers, resolved = _onnx_providers_for("cuda", allow_cpu_fallback=True)
 
         assert providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "cuda"
@@ -90,7 +90,7 @@ def test_onnx_providers_explicit_cuda_unavailable_warns():
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
         with patch("tools.episode_run.LOGGER") as mock_logger:
-            providers, resolved = _onnx_providers_for("cuda")
+            providers, resolved = _onnx_providers_for("cuda", allow_cpu_fallback=True)
 
             assert providers == ["CPUExecutionProvider"]
             assert resolved == "cpu"
@@ -109,7 +109,7 @@ def test_onnx_providers_explicit_mps_selects_coreml():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("mps")
+        providers, resolved = _onnx_providers_for("mps", allow_cpu_fallback=True)
 
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "coreml"
@@ -126,7 +126,7 @@ def test_onnx_providers_explicit_metal_selects_coreml():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("metal")
+        providers, resolved = _onnx_providers_for("metal", allow_cpu_fallback=True)
 
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "coreml"
@@ -143,7 +143,7 @@ def test_onnx_providers_explicit_apple_selects_coreml():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("apple")
+        providers, resolved = _onnx_providers_for("apple", allow_cpu_fallback=True)
 
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         assert resolved == "coreml"
@@ -158,7 +158,7 @@ def test_onnx_providers_explicit_mps_unavailable_warns():
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
         with patch("tools.episode_run.LOGGER") as mock_logger:
-            providers, resolved = _onnx_providers_for("mps")
+            providers, resolved = _onnx_providers_for("mps", allow_cpu_fallback=True)
 
             assert providers == ["CPUExecutionProvider"]
             assert resolved == "cpu"
@@ -196,7 +196,7 @@ def test_onnx_providers_none_defaults_to_auto():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for(None)
+        providers, resolved = _onnx_providers_for(None, allow_cpu_fallback=True)
 
         # Should auto-detect and select CoreML
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
@@ -212,7 +212,7 @@ def test_onnx_providers_import_error_fallback():
     mock_ort.get_available_providers.side_effect = Exception("Import failed")
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         assert providers == ["CPUExecutionProvider"]
         assert resolved == "cpu"
@@ -226,7 +226,7 @@ def test_onnx_providers_get_providers_error_fallback():
     mock_ort.get_available_providers.side_effect = RuntimeError("Provider enumeration failed")
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         assert providers == ["CPUExecutionProvider"]
         assert resolved == "cpu"
@@ -253,7 +253,7 @@ def test_onnx_providers_macos_scenario():
     ]
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
-        providers, resolved = _onnx_providers_for("auto")
+        providers, resolved = _onnx_providers_for("auto", allow_cpu_fallback=True)
 
         # Should select CoreML, NOT CPU
         assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
