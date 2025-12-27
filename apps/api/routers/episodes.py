@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 import uuid
+from enum import Enum
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -922,8 +923,8 @@ def _load_faces(
     return rows
 
 
-def _write_faces(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
-    path = _faces_path(ep_id)
+def _write_faces(ep_id: str, rows: List[Dict[str, Any]], *, run_id: str | None = None) -> Path:
+    path = _faces_path_for_run(ep_id, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -950,8 +951,8 @@ def _load_tracks(ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any
     return rows
 
 
-def _write_tracks(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
-    path = _tracks_path(ep_id)
+def _write_tracks(ep_id: str, rows: List[Dict[str, Any]], *, run_id: str | None = None) -> Path:
+    path = _tracks_path_for_run(ep_id, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -969,8 +970,8 @@ def _load_identities(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]
         return {"ep_id": ep_id, "identities": [], "stats": {}}
 
 
-def _write_identities(ep_id: str, payload: Dict[str, Any]) -> Path:
-    path = _identities_path(ep_id)
+def _write_identities(ep_id: str, payload: Dict[str, Any], *, run_id: str | None = None) -> Path:
+    path = _identities_path_for_run(ep_id, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -1199,15 +1200,15 @@ def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> 
     return None
 
 
-def _recount_track_faces(ep_id: str) -> None:
-    faces = _load_faces(ep_id, include_skipped=False)
+def _recount_track_faces(ep_id: str, *, run_id: str | None = None) -> None:
+    faces = _load_faces(ep_id, include_skipped=False, run_id=run_id)
     counts: Dict[int, int] = defaultdict(int)
     for face in faces:
         try:
             counts[int(face.get("track_id", -1))] += 1
         except (TypeError, ValueError):
             continue
-    track_rows = _load_tracks(ep_id)
+    track_rows = _load_tracks(ep_id, run_id=run_id)
     if not track_rows:
         return
     for row in track_rows:
@@ -1216,7 +1217,7 @@ def _recount_track_faces(ep_id: str) -> None:
         except (TypeError, ValueError):
             track_id = -1
         row["faces_count"] = counts.get(track_id, 0)
-    path = _write_tracks(ep_id, track_rows)
+    path = _write_tracks(ep_id, track_rows, run_id=run_id)
     _sync_manifests(ep_id, path)
 
 
@@ -1898,6 +1899,15 @@ class EpisodeDetailResponse(BaseModel):
     local: EpisodeLocalStatus
 
 
+class PhaseStatusValue(str, Enum):
+    pending = "pending"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    skipped = "skipped"
+    cancelled = "cancelled"
+
+
 class PhaseStatus(BaseModel):
     phase: str
     status: str
@@ -2013,12 +2023,12 @@ class PurgeAllIn(BaseModel):
 
 
 @router.get("/episodes", response_model=EpisodeListResponse, tags=["episodes"])
-def list_episodes() -> EpisodeListResponse:
+def list_episodes(limit: int = Query(200, gt=0, le=1000, description="Max episodes to return")) -> EpisodeListResponse:
     """List all episodes with timestamps for sorting by recent activity.
 
     Show slugs are normalized to UPPERCASE for consistent display.
     """
-    records = EPISODE_STORE.list()
+    records = EPISODE_STORE.list()[:limit]
     episodes = [
         EpisodeSummary(
             ep_id=record.ep_id,
@@ -2044,6 +2054,9 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
         ep_id = obj.get("ep_id")
         if not isinstance(ep_id, str):
             continue
+        key_version = obj.get("key_version")
+        if key_version not in {"v1", "v2"}:
+            continue
         if q and q.lower() not in ep_id.lower():
             continue
         items.append(
@@ -2058,7 +2071,7 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
                 last_modified=(str(obj.get("last_modified")) if obj.get("last_modified") else None),
                 etag=obj.get("etag"),
                 exists_in_store=EPISODE_STORE.exists(ep_id),
-                key_version=obj.get("key_version"),
+                key_version=key_version,
             )
         )
         if len(items) >= limit:
@@ -2286,16 +2299,20 @@ def _episode_run_status(ep_id: str, run_id: str | None) -> EpisodeStatusResponse
 
     # If detect/track is newer than faces, faces are stale
     if detect_track_mtime and faces_mtime and detect_track_mtime > faces_mtime:
-        if faces_payload.get("manifest_exists"):
-            faces_stale = True
-            faces_manifest_fallback = True
-            # Mark faces status as stale
-            if faces_payload.get("status") == "success":
-                faces_payload["status"] = "stale"
+        faces_stale = True
+        faces_manifest_fallback = True
+        # Mark faces status as stale (even if manifest was removed on rerun)
+        if faces_payload.get("status") in {"success", "missing"}:
+            faces_payload["status"] = "stale"
+        faces_payload["source"] = "outdated_after_redetect"
 
     # If detect/track or faces is newer than cluster, cluster is stale
     # Check both manifest_exists and track_metrics_exists for stale detection
-    has_cluster_output = cluster_payload.get("manifest_exists") or cluster_payload.get("track_metrics_exists")
+    has_cluster_output = (
+        cluster_payload.get("manifest_exists")
+        or cluster_payload.get("track_metrics_exists")
+        or cluster_payload.get("source") == "marker"
+    )
     if has_cluster_output:
         if detect_track_mtime and cluster_mtime and detect_track_mtime > cluster_mtime:
             cluster_stale = True
@@ -2303,11 +2320,13 @@ def _episode_run_status(ep_id: str, run_id: str | None) -> EpisodeStatusResponse
             tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
             if cluster_payload.get("status") == "success":
                 cluster_payload["status"] = "stale"
+            cluster_payload["source"] = "outdated_after_redetect"
         elif faces_mtime and cluster_mtime and faces_mtime > cluster_mtime:
             cluster_stale = True
             tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
             if cluster_payload.get("status") == "success":
                 cluster_payload["status"] = "stale"
+            cluster_payload["source"] = "outdated_after_faces"
         # Even if not stale, mark tracks_only_fallback if using metrics fallback
         if not cluster_stale and not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists"):
             tracks_only_fallback = True
@@ -2347,10 +2366,30 @@ def _episode_run_status(ep_id: str, run_id: str | None) -> EpisodeStatusResponse
     )
 
 
+def get_episode_status(ep_id: str, run_id: str | None = None) -> EpisodeStatusResponse:
+    ep_id_norm = normalize_ep_id(ep_id)
+    if not EPISODE_STORE.exists(ep_id_norm):
+        run_ids = run_layout.list_run_ids(ep_id_norm)
+        manifests_dir = _manifests_dir(ep_id_norm)
+        has_manifest = any(
+            (manifests_dir / name).exists()
+            for name in (
+                "detections.jsonl",
+                "tracks.jsonl",
+                "faces.jsonl",
+                "identities.json",
+                "track_metrics.json",
+            )
+        )
+        if not run_ids and not has_manifest:
+            raise HTTPException(status_code=404, detail=f"Episode not found: {ep_id_norm}")
+    return _episode_run_status(ep_id_norm, run_id)
+
+
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str, run_id: str | None = Query(None)) -> EpisodeStatusResponse:
     try:
-        return _episode_run_status(ep_id, run_id)
+        return get_episode_status(ep_id, run_id)
     except ValueError as exc:
         # FastAPI will coerce query params to str; validate run_id explicitly.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2506,13 +2545,21 @@ def export_run_debug_bundle(
     )
 
     ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    run_root = run_layout.run_root(ep_id_norm, run_id_norm)
+    if not run_root.exists():
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id_norm}")
 
     if format == "zip":
         # ZIP export
         try:
             zip_path, download_name, upload_result = build_and_upload_debug_bundle(
                 ep_id=ep_id_norm,
-                run_id=run_id,
+                run_id=run_id_norm,
                 include_artifacts=include_artifacts,
                 include_logs=include_logs,
                 upload_to_s3=upload_to_s3,
@@ -2555,7 +2602,7 @@ def export_run_debug_bundle(
         try:
             pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
                 ep_id=ep_id_norm,
-                run_id=run_id,
+                run_id=run_id_norm,
                 include_screentime=include_screentime,
                 upload_to_s3=upload_to_s3,
                 fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
@@ -7224,28 +7271,30 @@ def delete_track(
     ep_id: str,
     track_id: int,
     payload: TrackDeleteRequest = Body(default=TrackDeleteRequest()),
+    run_id: str | None = Query(default=None, description="Run id scope for manifests"),
 ) -> dict:
-    identities_payload = _load_identities(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+    identities_payload = _load_identities(ep_id, run_id=run_id_norm)
     track_identity_map = _identity_lookup(identities_payload)
     source_identity_id = track_identity_map.get(track_id)
-    faces = _load_faces(ep_id)
+    faces = _load_faces(ep_id, run_id=run_id_norm)
     if payload.delete_faces:
         faces = [row for row in faces if int(row.get("track_id", -1)) != track_id]
-        faces_path = _write_faces(ep_id, faces)
+        faces_path = _write_faces(ep_id, faces, run_id=run_id_norm)
     else:
-        faces_path = _faces_path(ep_id)
-    track_rows = _load_tracks(ep_id)
+        faces_path = _faces_path_for_run(ep_id, run_id_norm)
+    track_rows = _load_tracks(ep_id, run_id=run_id_norm)
     kept_tracks = [row for row in track_rows if int(row.get("track_id", -1)) != track_id]
     if len(kept_tracks) == len(track_rows):
         raise HTTPException(status_code=404, detail="Track not found")
-    tracks_path = _write_tracks(ep_id, kept_tracks)
+    tracks_path = _write_tracks(ep_id, kept_tracks, run_id=run_id_norm)
     for identity in identities_payload.get("identities", []):
         identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
-    _update_identity_stats(ep_id, identities_payload)
-    identities_path = _write_identities(ep_id, identities_payload)
-    _recount_track_faces(ep_id)
+    _update_identity_stats(ep_id, identities_payload, run_id=run_id_norm)
+    identities_path = _write_identities(ep_id, identities_payload, run_id=run_id_norm)
+    _recount_track_faces(ep_id, run_id=run_id_norm)
     _sync_manifests(ep_id, faces_path, tracks_path, identities_path)
-    _refresh_similarity_indexes(ep_id, track_ids=[track_id], identity_ids=[source_identity_id])
+    _refresh_similarity_indexes(ep_id, track_ids=[track_id], identity_ids=[source_identity_id], run_id=run_id_norm)
     return {"track_id": track_id, "faces_deleted": payload.delete_faces}
 
 

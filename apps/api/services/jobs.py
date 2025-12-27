@@ -375,6 +375,18 @@ class JobService:
         manifests_dir = get_path(ep_id, "detections").parent
         return manifests_dir / "progress.json"
 
+    def _invalidate_downstream_artifacts(self, ep_id: str) -> None:
+        manifests_dir = get_path(ep_id, "detections").parent
+        for filename in ("faces.jsonl", "identities.json", "track_metrics.json"):
+            path = manifests_dir / filename
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        embeds_dir = manifests_dir.parent / "embeds" / ep_id
+        if embeds_dir.exists():
+            shutil.rmtree(embeds_dir)
+
     def _read_progress(self, path: Path) -> Optional[Dict[str, Any]]:
         if not path.exists():
             return None
@@ -500,6 +512,7 @@ class JobService:
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
+        self._invalidate_downstream_artifacts(ep_id)
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
         resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
@@ -709,6 +722,7 @@ class JobService:
         thumb_size: int,
         actions: List[str],
         write_back: bool,
+        profile: str | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
@@ -759,6 +773,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if fps and fps > 0:
             command += ["--fps", str(fps)]
         if det_thresh is not None:
@@ -799,6 +815,7 @@ class JobService:
             "thumb_size": thumb_size,
             "actions": normalized_actions,
             "write_back": write_back,
+            "profile": profile,
         }
         return self._launch_job(
             job_type="episode_cleanup",

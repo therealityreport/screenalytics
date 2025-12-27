@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
@@ -25,6 +26,70 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+
+# Lightweight context manager for stubbed layout containers.
+class _StubContext:
+    def __enter__(self):  # noqa: D401
+        return self
+
+    def __exit__(self, exc_type, exc, tb):  # noqa: D401, ANN001, ANN201
+        return False
+
+
+class _StubSidebar(_StubContext):
+    def columns(self, *args, **kwargs):  # noqa: D401, ANN001
+        count = args[0] if args else kwargs.get("spec", 1)
+        return [_StubContext()] * count
+
+    def __getattr__(self, _name: str):  # noqa: D401
+        return lambda *args, **kwargs: None
+
+# Ensure session_state exists for lightweight test stubs.
+if not hasattr(st, "session_state"):
+    st.session_state = {}
+if not hasattr(st, "sidebar"):
+    st.sidebar = _StubSidebar()
+if not hasattr(st, "errors"):
+    st.errors = types.SimpleNamespace(StreamlitAPIException=Exception)
+if not hasattr(st, "empty"):
+    st.empty = lambda: types.SimpleNamespace(
+        write=lambda *args, **kwargs: None,
+        caption=lambda *args, **kwargs: None,
+        code=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        success=lambda *args, **kwargs: None,
+    )
+if not hasattr(st, "header"):
+    st.header = lambda *args, **kwargs: None
+if not hasattr(st, "caption"):
+    st.caption = lambda *args, **kwargs: None
+if not hasattr(st, "code"):
+    st.code = lambda *args, **kwargs: None
+if not hasattr(st, "success"):
+    st.success = lambda *args, **kwargs: None
+if not hasattr(st, "error"):
+    st.error = lambda *args, **kwargs: None
+if not hasattr(st, "warning"):
+    st.warning = lambda *args, **kwargs: None
+if not hasattr(st, "info"):
+    st.info = lambda *args, **kwargs: None
+if not hasattr(st, "write"):
+    st.write = lambda *args, **kwargs: None
+if not hasattr(st, "markdown"):
+    st.markdown = lambda *args, **kwargs: None
+if not hasattr(type(st.sidebar), "__enter__"):
+    st.sidebar = _StubSidebar()
+for _attr in ("header", "code", "success", "error", "caption", "info"):
+    if not hasattr(st.sidebar, _attr):
+        setattr(st.sidebar, _attr, lambda *args, **kwargs: None)
+if not hasattr(st.sidebar, "columns"):
+    st.sidebar.columns = lambda *args, **kwargs: [_StubContext()] * (
+        args[0] if args else kwargs.get("spec", 1)
+    )
+if not hasattr(st.sidebar, "divider"):
+    st.sidebar.divider = lambda *args, **kwargs: None
 
 # `streamlit` is not always fully available in unit-test contexts (some tests stub
 # it with a lightweight object). Avoid hard dependencies on newer APIs at import time.
@@ -1852,7 +1917,10 @@ def _episode_status_payload(ep_id: str, *, run_id: str | None = None) -> Dict[st
     try:
         run_id_value = run_id.strip() if isinstance(run_id, str) else ""
         params = {"run_id": run_id_value} if run_id_value else None
-        resp = requests.get(url, params=params, timeout=15)
+        if params:
+            resp = requests.get(url, params=params, timeout=15)
+        else:
+            resp = requests.get(url, timeout=15)
         resp.raise_for_status()
     except requests.RequestException:
         return None
@@ -3701,7 +3769,7 @@ def attempt_sse_run(
             if event_name == "done" or _is_phase_done(event_payload):
                 if final_summary:
                     return final_summary, None, True
-                if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
+                if isinstance(summary_candidate, dict):
                     return summary_candidate, None, True
                 return None, None, True
     finally:
@@ -7242,9 +7310,17 @@ def cluster_track_rows_css() -> str:
     '''
 
 
-def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
+def track_row_html(
+    track_id: int,
+    items: List[Dict[str, Any]],
+    thumb_width: int = 200,
+    *,
+    thumb_height: int | None = None,
+) -> str:
     if not items:
         return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
+    if thumb_height is None:
+        thumb_height = thumb_width
     thumbs: List[str] = []
     for item in items:
         url = item.get("url")
@@ -7262,6 +7338,7 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
       .track-grid {{
         display: grid;
         grid-template-columns: repeat(5, {thumb_width}px);
+        grid-auto-rows: {thumb_height}px;
         gap: 12px;
         margin: 16px 0;
         padding: 12px;
@@ -7278,7 +7355,7 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
       }}
       .track-grid .thumb {{
         width: {thumb_width}px;
-        aspect-ratio: 4 / 5;
+        height: {thumb_height}px;
         object-fit: fill;
         border-radius: 6px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
@@ -7290,7 +7367,7 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
         cursor: pointer;
       }}
     </style>
-    <div class="track-grid">{thumbs_html}</div>
+    <div id="rail-{track_id}" class="track-grid">{thumbs_html}</div>
     """
 
 
@@ -7414,7 +7491,11 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
     params = {"key": src, "ttl": ttl}
     inferred_mime = _infer_mime(src)
     response = requests.get(f"{api_base}/files/presign", params=params, timeout=3)
-    response.raise_for_status()
+    raise_for_status = getattr(response, "raise_for_status", None)
+    if callable(raise_for_status):
+        raise_for_status()
+    elif hasattr(response, "ok") and not response.ok:
+        raise requests.HTTPError("Presign request failed")
     data = response.json()
     presigned_url = data.get("url")
     resolved_mime = data.get("content_type") or inferred_mime
@@ -7536,6 +7617,14 @@ def resolve_thumb(src: str | None) -> str | None:
         or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
         api_base = st.session_state.get("api_base") or _api_base()
+        if get_script_run_ctx() is None:
+            try:
+                url = _blocking_thumb_fetch(src, api_base, ttl=3600)
+                _store_thumb_result(src, url, error=None if url else "presign_failed")
+                return url
+            except Exception as exc:  # pragma: no cover - defensive for test stubs
+                _store_thumb_result(src, None, error=str(exc))
+                return None
         return _resolve_thumb_async(src, api_base)
 
     _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")

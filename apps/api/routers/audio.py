@@ -30,6 +30,16 @@ router = APIRouter(prefix="/jobs", tags=["audio"])
 edit_router = APIRouter(tags=["audio"])
 LOGGER = logging.getLogger(__name__)
 
+try:
+    from celery.result import AsyncResult  # type: ignore
+except Exception:  # pragma: no cover - optional celery dependency for tests
+    AsyncResult = None  # type: ignore
+
+try:
+    from apps.api.jobs_audio import episode_audio_pipeline_async as episode_audio_pipeline_task
+except Exception:  # pragma: no cover - optional audio pipeline dependency for tests
+    episode_audio_pipeline_task = None  # type: ignore
+
 
 # =============================================================================
 # Request/Response Models
@@ -83,6 +93,7 @@ class FinalizeTranscriptRequest(BaseModel):
 class AudioPipelineResponse(BaseModel):
     """Response from starting audio pipeline."""
     job_id: Optional[str] = None
+    job_type: Optional[str] = None
     status: str
     ep_id: str
     run_mode: Optional[str] = None
@@ -365,7 +376,7 @@ async def smart_split_segment(ep_id: str, req: SmartSplitRequest) -> dict:
 # =============================================================================
 
 
-@router.post("/episode_audio_pipeline", response_model=AudioPipelineResponse)
+@router.post("/episode_audio_pipeline", response_model=AudioPipelineResponse, status_code=202)
 async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineResponse:
     """Start the audio pipeline for an episode.
 
@@ -403,9 +414,25 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
 
         # Queue via Celery
         try:
-            from apps.api.jobs_audio import episode_audio_pipeline_async
+            if episode_audio_pipeline_task is None:
+                raise HTTPException(status_code=503, detail="Audio pipeline task unavailable")
 
-            result = episode_audio_pipeline_async(
+            if hasattr(episode_audio_pipeline_task, "delay"):
+                result = episode_audio_pipeline_task.delay(
+                    req.ep_id,
+                    overwrite=req.overwrite,
+                    asr_provider=asr_provider,
+                )
+                job_id = getattr(result, "id", None)
+                return AudioPipelineResponse(
+                    job_id=job_id,
+                    job_type="audio_pipeline",
+                    status="queued",
+                    ep_id=req.ep_id,
+                    run_mode=run_mode,
+                )
+
+            result = episode_audio_pipeline_task(
                 req.ep_id,
                 overwrite=req.overwrite,
                 asr_provider=asr_provider,
@@ -420,6 +447,7 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
 
             return AudioPipelineResponse(
                 job_id=result.get("job_id"),
+                job_type="audio_pipeline",
                 status="queued",
                 ep_id=req.ep_id,
                 run_mode=run_mode,
@@ -606,6 +634,7 @@ async def download_audio_qc(ep_id: str) -> dict:
 
 
 @router.get("/audio/prerequisites")
+@edit_router.get("/audio/prerequisites")
 async def check_audio_prerequisites() -> dict:
     """Check if audio pipeline prerequisites are met.
 

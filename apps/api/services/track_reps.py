@@ -134,6 +134,8 @@ def _discover_crop_path(
 def _load_faces_for_track(ep_id: str, track_id: int, *, run_id: str | None = None) -> List[Dict[str, Any]]:
     """Load all faces for a specific track."""
     faces_path = _faces_path(ep_id, run_id=run_id)
+    if run_id and not faces_path.exists():
+        faces_path = _faces_path(ep_id, run_id=None)
     if not faces_path.exists():
         return []
 
