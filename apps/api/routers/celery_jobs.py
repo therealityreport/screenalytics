@@ -917,6 +917,15 @@ class ClusterCeleryRequest(BaseModel):
     )
 
 
+class ParallelJobRequest(BaseModel):
+    """Request model for parallel job execution across episodes."""
+    episode_ids: List[str] = Field(..., min_length=1, description="Episode IDs to process in parallel")
+    operation: Literal["auto_group", "refresh_similarity", "manual_assign"] = Field(
+        ..., description="Operation to run for each episode"
+    )
+    options: Dict[str, Any] | None = Field(None, description="Optional task options to pass to each job")
+
+
 def _normalize_optional_run_id(value: Any) -> str | None:
     """Normalize run_id for run-scoped artifacts; returns None when absent."""
     if value is None:
