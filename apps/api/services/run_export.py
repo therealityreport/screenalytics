@@ -54,6 +54,9 @@ from py_screenalytics.run_manifests import (
     write_stage_manifest,
 )
 from py_screenalytics.run_logs import append_log, tail_logs
+from apps.api.services.assignment_resolver import resolve_cluster_assignment
+from apps.api.services.assignments import load_assignment_state
+from apps.api.services.storage import StorageService
 
 LOGGER = logging.getLogger(__name__)
 
@@ -309,11 +312,16 @@ def _safe_add_dir(
         LOGGER.warning("[export] Failed to add directory %s: %s", root, exc)
 
 
-def _identity_assignments_snapshot(identities_payload: dict[str, Any] | None) -> dict[str, Any]:
+def _identity_assignments_snapshot(
+    ep_id: str,
+    identities_payload: dict[str, Any] | None,
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     payload = identities_payload or {}
-    manual_assignments = payload.get("manual_assignments") if isinstance(payload, dict) else None
-    if not isinstance(manual_assignments, dict):
-        manual_assignments = {}
+    run_id_norm = run_layout.normalize_run_id(run_id) if run_id else None
+    assignment_state = load_assignment_state(ep_id, run_id_norm, include_inferred=True)
+    cluster_assignments = assignment_state.get("cluster_assignments", {})
     identities = payload.get("identities") if isinstance(payload, dict) else None
     if not isinstance(identities, list):
         identities = []
@@ -327,11 +335,10 @@ def _identity_assignments_snapshot(identities_payload: dict[str, Any] | None) ->
             continue
         identity_id_str = str(identity_id)
         person_id = identity.get("person_id")
-        meta = manual_assignments.get(identity_id_str) if isinstance(manual_assignments, dict) else None
-        if not isinstance(meta, dict):
-            meta = {}
-        assigned_by = meta.get("assigned_by")
-        method = "manual" if assigned_by == "user" else ("auto" if assigned_by == "auto" else None)
+        assignment = resolve_cluster_assignment(identity_id_str, cluster_assignments)
+        source = assignment.get("source")
+        assigned_by = "user" if source == "manual" else ("auto" if source == "auto" else None)
+        method = "manual" if source == "manual" else ("auto" if source == "auto" else None)
         rows.append(
             {
                 "identity_id": identity_id_str,
@@ -341,8 +348,8 @@ def _identity_assignments_snapshot(identities_payload: dict[str, Any] | None) ->
                 "track_ids": identity.get("track_ids") or [],
                 "method": method,
                 "assigned_by": assigned_by,
-                "cast_id": meta.get("cast_id"),
-                "timestamp": meta.get("timestamp"),
+                "cast_id": assignment.get("cast_id"),
+                "timestamp": assignment.get("updated_at"),
             }
         )
 
@@ -487,7 +494,7 @@ def build_run_debug_bundle_zip(
         "db_error": db_error,
     }
 
-    assignments_payload = _identity_assignments_snapshot(identities_payload)
+    assignments_payload = _identity_assignments_snapshot(ep_id, identities_payload, run_id=run_id_norm)
     assignments_payload["ep_id"] = ep_id
     assignments_payload["run_id"] = run_id_norm
     assignments_payload["generated_at"] = run_summary["generated_at"]
@@ -1514,8 +1521,6 @@ def _build_run_debug_pdf_bytes(*, ep_id: str, run_id: str) -> bytes:
         for key in sorted(storage_payload.keys()):
             env_rows.append((f"storage.{key}", _fmt_val(storage_payload.get(key))))
     try:
-        from apps.api.services.storage import StorageService
-
         storage_service = StorageService()
         if storage_service.s3_enabled():
             stage_map: dict[str, str] = {}

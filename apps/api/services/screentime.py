@@ -17,6 +17,9 @@ from enum import Enum
 from py_screenalytics.artifacts import get_path
 from py_screenalytics import run_layout
 
+from apps.api.services.assignments import load_assignment_state
+from apps.api.services.assignment_resolver import resolve_track_assignment
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -104,6 +107,10 @@ class ScreenTimeAnalyzer:
         identities = self._load_identities(ep_id, run_id=run_id_norm)
         people, show_id = self._load_people(ep_id)
         cast_members = self._load_cast_members(show_id)
+        assignment_state = load_assignment_state(ep_id, run_id_norm, include_inferred=True)
+        cluster_assignments = assignment_state.get("cluster_assignments", {})
+        track_overrides = assignment_state.get("track_overrides", {})
+        face_exclusions = assignment_state.get("face_exclusions", {})
 
         diagnostics["faces_loaded"] = len(faces)
         diagnostics["tracks_loaded"] = len(tracks)
@@ -176,28 +183,38 @@ class ScreenTimeAnalyzer:
         unassigned_intervals: List[Tuple[float, float]] = []
 
         for track_id, track_faces in faces_by_track.items():
+            if face_exclusions:
+                filtered_faces = []
+                for face in track_faces:
+                    face_id = face.get("face_id")
+                    exclusion_entry = face_exclusions.get(str(face_id)) if face_id else None
+                    if isinstance(exclusion_entry, dict) and exclusion_entry.get("excluded", True):
+                        continue
+                    filtered_faces.append(face)
+                track_faces = filtered_faces
+                if not track_faces:
+                    continue
             # Resolve track -> identity -> person -> cast
             identity_id = track_to_identity.get(track_id)
             if not identity_id:
                 diagnostics["tracks_missing_identity"] += 1
                 continue
-
             person_id = identity_to_person.get(identity_id)
             if not person_id:
                 diagnostics["tracks_missing_person"] += 1
                 LOGGER.debug(f"[screentime] Track {track_id} -> identity {identity_id} has no person_id mapping")
-                # Collect interval for unassigned track
-                track_meta = tracks_by_id.get(track_id)
-                valid_faces = [face for face in track_faces if face.get("quality", 1.0) >= self.config.quality_min]
-                if valid_faces:
-                    intervals = self._build_track_intervals(track_id, valid_faces, track_meta)
-                    unassigned_intervals.extend(intervals)
-                continue
 
-            cast_id = person_to_cast.get(person_id)
+            assignment = resolve_track_assignment(
+                track_id,
+                str(identity_id),
+                cluster_assignments,
+                track_overrides,
+            )
+            cast_id = assignment.get("cast_id")
             if not cast_id:
                 diagnostics["tracks_missing_cast"] += 1
-                LOGGER.debug(f"[screentime] Track {track_id} -> person {person_id} has no cast_id, skipping")
+                if person_id:
+                    LOGGER.debug(f"[screentime] Track {track_id} -> identity {identity_id} has no cast assignment")
                 # Collect interval for track without cast assignment
                 track_meta = tracks_by_id.get(track_id)
                 valid_faces = [face for face in track_faces if face.get("quality", 1.0) >= self.config.quality_min]
@@ -205,6 +222,8 @@ class ScreenTimeAnalyzer:
                     intervals = self._build_track_intervals(track_id, valid_faces, track_meta)
                     unassigned_intervals.extend(intervals)
                 continue
+
+            person_id_for_metrics = person_id or f"cast:{cast_id}"
 
             # This track has a full chain to cast_id
             diagnostics["tracks_with_cast_id"] += 1
@@ -214,7 +233,7 @@ class ScreenTimeAnalyzer:
             if cast_id not in cast_metrics_map:
                 cast_metrics_map[cast_id] = CastMetrics(
                     cast_id=cast_id,
-                    person_id=person_id,
+                    person_id=person_id_for_metrics,
                     visual_s=0.0,
                     speaking_s=0.0,
                     both_s=0.0,
@@ -833,6 +852,9 @@ class ScreenTimeAnalyzer:
             # Use person_id as last resort
             else:
                 mapping[person_id] = person_id
+
+            if cast_id:
+                mapping[f"cast:{cast_id}"] = cast_name_lookup.get(cast_id, cast_id)
 
         return mapping
 
