@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -80,6 +81,8 @@ def _infer_cluster_assignments(
     payload: Dict[str, Any],
     show_id: str | None,
     *,
+    ep_id: str | None = None,
+    run_id: str | None = None,
     data_root: Path | str | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     if not show_id:
@@ -110,7 +113,53 @@ def _infer_cluster_assignments(
             "assigned_by": "auto",
             "source": "auto",
         }
+    if ep_id:
+        run_scoped: Dict[str, str] = {}
+        legacy: Dict[str, str] = {}
+        for person in people:
+            if not isinstance(person, dict):
+                continue
+            cast_id = person.get("cast_id")
+            if not cast_id:
+                continue
+            cluster_ids = person.get("cluster_ids") or []
+            run_clusters, legacy_clusters = _split_cluster_ids(cluster_ids, ep_id, run_id)
+            for cluster_id in run_clusters:
+                run_scoped[str(cluster_id)] = cast_id
+            for cluster_id in legacy_clusters:
+                legacy.setdefault(str(cluster_id), cast_id)
+
+        use_map = run_scoped or (legacy if not run_id or not run_scoped else {})
+        for cluster_id, cast_id in use_map.items():
+            inferred.setdefault(
+                str(cluster_id),
+                {
+                    "cast_id": cast_id,
+                    "assigned_by": "auto",
+                    "source": "auto",
+                },
+            )
     return inferred
+
+
+def _split_cluster_ids(
+    cluster_ids: Iterable[Any],
+    ep_id: str,
+    run_id: str | None,
+) -> Tuple[List[str], List[str]]:
+    run_cluster_ids: List[str] = []
+    legacy_cluster_ids: List[str] = []
+    run_prefix = f"{ep_id}:{run_id}:" if run_id else None
+    episode_prefix = f"{ep_id}:"
+    for raw in cluster_ids:
+        if not isinstance(raw, str):
+            continue
+        if run_prefix and raw.startswith(run_prefix):
+            run_cluster_ids.append(raw[len(run_prefix):])
+            continue
+        if raw.startswith(episode_prefix):
+            legacy_cluster_ids.append(raw[len(episode_prefix):])
+    return run_cluster_ids, legacy_cluster_ids
 
 
 def _apply_assignment_update(
@@ -166,6 +215,8 @@ def load_assignment_state(
     include_inferred: bool = True,
 ) -> Dict[str, Any]:
     run_id_norm = run_layout.normalize_run_id(run_id) if run_id else None
+    if data_root is None:
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
     payload = load_identities(ep_id, run_id=run_id_norm)
     manual_assignments = _normalize_assignment_map(payload.get("manual_assignments"))
     track_overrides = _normalize_assignment_map(payload.get("track_overrides"))
@@ -174,7 +225,13 @@ def load_assignment_state(
     cluster_assignments = dict(manual_assignments)
     if include_inferred:
         show_id = _parse_show_id(ep_id)
-        inferred = _infer_cluster_assignments(payload, show_id, data_root=data_root)
+        inferred = _infer_cluster_assignments(
+            payload,
+            show_id,
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            data_root=data_root,
+        )
         for cluster_id, entry in inferred.items():
             cluster_assignments.setdefault(cluster_id, entry)
 
