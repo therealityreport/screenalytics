@@ -672,9 +672,14 @@ def _fetch_unlinked_entities(ep_id: str) -> Dict[str, Any] | None:
 
 
 @st.cache_data(ttl=15)
-def _fetch_archived_ids(ep_id: str) -> Dict[str, set]:
+def _fetch_archived_ids(ep_id: str, run_id: str | None = None) -> Dict[str, set]:
     """Fetch archived cluster/track ids for an episode so UI can hide them."""
-    show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+    parsed = helpers.parse_ep_id(ep_id) or {}
+    show_value = parsed.get("show")
+    if show_value:
+        show_id = str(show_value).upper()
+    else:
+        show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
     resp = _safe_api_get(
         f"/archive/shows/{show_id}",
         params={"episode_id": ep_id, "limit": 500},
@@ -920,7 +925,11 @@ def _get_best_crop_from_clusters(
             else:
                 score = 0.0
 
-            crop_url = track.get("crop_url")
+            crop_url = (
+                track.get("crop_url")
+                or track.get("rep_thumb_url")
+                or track.get("rep_media_url")
+            )
             if not crop_url:
                 continue
 
@@ -2984,7 +2993,10 @@ def _render_unassigned_cluster_card(
     counts = cluster_meta.get("counts", {})
     original_tracks_count = counts.get("tracks", 0)
     original_faces_count = counts.get("faces", 0)
-    track_list = cluster_meta.get("tracks", [])
+    raw_tracks = cluster_meta.get("tracks")
+    has_track_details = isinstance(raw_tracks, list)
+    track_list = raw_tracks if has_track_details else []
+    missing_track_details = not has_track_details and original_tracks_count > 0
 
     # For single-track clusters, show even single-frame tracks (with low-confidence badge)
     # For multi-track clusters, filter out single-frame tracks as noise UNLESS that would leave 0 tracks
@@ -3009,9 +3021,12 @@ def _render_unassigned_cluster_card(
     # Recalculate counts after filtering
     tracks_count = len(track_list)
     faces_count = sum(t.get("faces", 0) for t in track_list)
+    if missing_track_details:
+        tracks_count = original_tracks_count
+        faces_count = original_faces_count
 
     # Show filtered-out cluster with explanation instead of silently skipping
-    if not track_list or tracks_count == 0:
+    if (not track_list or tracks_count == 0) and not missing_track_details:
         with st.container(border=True):
             st.markdown(f"### 🔍 Cluster `{cluster_id}`")
             # Distinguish between empty clusters (no tracks) vs filtered clusters (all single-frame)
@@ -3086,6 +3101,10 @@ def _render_unassigned_cluster_card(
             if filtered_tracks_count > 0:
                 caption_parts.append(f"({filtered_tracks_count} single-frame filtered)")
             st.caption(" ".join(caption_parts))
+            if missing_track_details:
+                st.warning(
+                    "Track details are unavailable for this cluster. Refresh or regenerate track reps to view frames."
+                )
             # Show similarity badge - use cluster cohesion for multi-track, internal similarity for single-track
             similarity_value = None
             similarity_label = None
@@ -4306,6 +4325,8 @@ def _render_people_view(
         st.error("Unable to determine show for this episode.")
         return
 
+    _render_cast_carousel(ep_id, show_id)
+
     # Build people lookup for quick access by person_id
     people_lookup = {str(person.get("person_id") or ""): person for person in people}
 
@@ -4385,7 +4406,6 @@ def _render_people_view(
             st.caption(f"Show-level cast members for {show_id}")
             _render_cast_gallery(ep_id, cast_gallery_cards, cluster_lookup, cluster_centroids)
         st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
-        return
 
     # Include legacy cast/person pairs (absent from cast.json) when they have clusters
     # Build lookup for cast entries by cast_id to get featured_thumbnail_url
@@ -4446,7 +4466,8 @@ def _render_people_view(
 
     # --- ARCHIVED ITEMS VIEWER ---
     # Show archived items for THIS EPISODE only (not entire show)
-    show_id_for_archive = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+    parsed_show = (helpers.parse_ep_id(ep_id) or {}).get("show")
+    show_id_for_archive = str(parsed_show).upper() if parsed_show else (ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper())
 
     # Fetch archived items filtered by episode_id
     archived_resp = _safe_api_get(
@@ -4562,6 +4583,10 @@ def _render_people_view(
     cast_options = {
         cm.get("cast_id"): cm.get("name") for cm in deduped_cast_entries if cm.get("cast_id") and cm.get("name")
     }
+    for cast_id, person in people_by_cast_id.items():
+        person_name = person.get("name")
+        if cast_id and person_name and cast_id not in cast_options:
+            cast_options[cast_id] = person_name
 
     # Suggestions: facebank (cached) and assigned-cluster similarity
     cast_suggestions_by_cluster = st.session_state.get(_cast_suggestions_cache_key(ep_id), {})
@@ -4596,7 +4621,7 @@ def _render_people_view(
         if entity.get("entity_type") == "person":
             person_id = entity.get("entity_id")
             person = people_lookup.get(str(person_id)) or entity.get("person") or {"person_id": person_id}
-            if filter_cast_id and str(person.get("person_id") or "") != str(filter_cast_id):
+            if filter_cast_id and str(person.get("cast_id") or "") != str(filter_cast_id):
                 continue
 
             item = {
@@ -6497,12 +6522,17 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                 # Sanity check: ensure best_face actually belongs to this track
                 best_face_track_id = coerce_int(best_face.get("track_id"))
                 if best_face_track_id != track_id:
-                    if debug_frames:
-                        st.error(
-                            f"BUG: best_face has track_id={best_face_track_id} but expected {track_id} "
-                            f"for frame {frame_idx}. Skipping."
-                        )
-                    continue
+                    best_face = next(
+                        (face for face in faces_for_track if coerce_int(face.get("track_id")) == track_id),
+                        None,
+                    )
+                    if best_face is None:
+                        if debug_frames:
+                            st.error(
+                                f"BUG: best_face has track_id={best_face_track_id} but expected {track_id} "
+                                f"for frame {frame_idx}. Skipping."
+                            )
+                        continue
                 face_id = best_face.get("face_id")
                 try:
                     frame_idx_int = int(frame_idx)
@@ -6921,7 +6951,7 @@ with ThreadPoolExecutor(max_workers=4) as executor:
         "people": _submit_with_ctx(executor, _fetch_people_cached, show_slug),
         "cast": _submit_with_ctx(executor, _fetch_cast_cached, show_slug, season_label),
         "cluster_tracks": _submit_with_ctx(executor, _safe_api_get, f"/episodes/{ep_id}/cluster_tracks"),
-        "archived": _submit_with_ctx(executor, _fetch_archived_ids, ep_id),
+        "archived": _submit_with_ctx(executor, _fetch_archived_ids, ep_id, _CURRENT_RUN_ID),
     }
     identities_payload = futures["identities"].result()
     people_resp = futures["people"].result()
@@ -6957,6 +6987,9 @@ def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, arc
             continue
         entry_copy = dict(entry)
         tracks_field = entry_copy.get("tracks")
+        filtered_tracks: list[Dict[str, Any]] | None = None
+        tracks_filtered = False
+        faces_total: int | None = None
         if isinstance(tracks_field, list):
             filtered_tracks = []
             for t in tracks_field:
@@ -6965,7 +6998,17 @@ def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, arc
                 if tid_int is not None and tid_int in archived_tracks:
                     continue
                 filtered_tracks.append(t)
+            if len(filtered_tracks) != len(tracks_field):
+                tracks_filtered = True
             entry_copy["tracks"] = filtered_tracks
+            faces_seen = False
+            faces_total = 0
+            for t in filtered_tracks:
+                if "faces" in t:
+                    faces_seen = True
+                    faces_total += coerce_int(t.get("faces")) or 0
+            if not faces_seen:
+                faces_total = None
         reps = entry_copy.get("track_reps") or []
         cleaned_reps = []
         for tr in reps:
@@ -6974,14 +7017,19 @@ def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, arc
             if tid_int is not None and tid_int in archived_tracks:
                 continue
             cleaned_reps.append(tr)
-        # Only update track_reps and counts if we actually filtered something
-        if len(cleaned_reps) != len(reps):
+        reps_filtered = len(cleaned_reps) != len(reps)
+        if reps_filtered:
             entry_copy["track_reps"] = cleaned_reps
+        if tracks_filtered or reps_filtered:
             counts = entry_copy.get("counts")
-            if isinstance(counts, dict):
-                counts = dict(counts)
+            counts = dict(counts) if isinstance(counts, dict) else {}
+            if isinstance(filtered_tracks, list):
+                counts["tracks"] = len(filtered_tracks)
+                if faces_total is not None:
+                    counts["faces"] = faces_total
+            elif reps_filtered:
                 counts["tracks"] = len(cleaned_reps)
-                entry_copy["counts"] = counts
+            entry_copy["counts"] = counts
         clusters.append(entry_copy)
     filtered["clusters"] = clusters
     return filtered
