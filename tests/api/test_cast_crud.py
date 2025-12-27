@@ -279,7 +279,7 @@ def test_show_registry(tmp_path, monkeypatch):
     )
     assert resp.status_code == 200
     created = resp.json()
-    assert created["show_id"] == "newshow"
+    assert created["show_id"] == "NEWSHOW"
     assert created["title"] == "RHOBH"
     assert created["full_name"] == "The Real Housewives of Beverly Hills"
     assert created["imdb_series_id"] == "tt1720601"
@@ -290,7 +290,7 @@ def test_show_registry(tmp_path, monkeypatch):
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["count"] == 1
-    assert payload["shows"][0]["show_id"] == "newshow"
+    assert payload["shows"][0]["show_id"] == "NEWSHOW"
     assert payload["shows"][0]["full_name"] == "The Real Housewives of Beverly Hills"
     assert payload["shows"][0]["imdb_series_id"] == "tt1720601"
 

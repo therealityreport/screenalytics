@@ -41,12 +41,12 @@ class TestAudioPipelineE2E:
     @patch("py_screenalytics.audio.enhance_resemble.enhance_audio_local")
     @patch("py_screenalytics.audio.diarization_nemo.run_diarization_nemo")
     @patch("py_screenalytics.audio.voice_clusters.cluster_episode_voices")
-    @patch("py_screanalytics.audio.voice_bank.match_voice_clusters_to_bank")
-    @patch("py_screanalytics.audio.asr_openai.transcribe_audio")
-    @patch("py_screanalytics.audio.fuse_diarization_asr.fuse_transcript")
-    @patch("py_screanalytics.audio.export.export_final_audio")
-    @patch("py_screanalytics.audio.io.get_audio_duration")
-    @patch("py_screanalytics.audio.io.compute_snr")
+    @patch("py_screenalytics.audio.voice_bank.match_voice_clusters_to_bank")
+    @patch("py_screenalytics.audio.asr_openai.transcribe_audio")
+    @patch("py_screenalytics.audio.fuse_diarization_asr.fuse_transcript")
+    @patch("py_screenalytics.audio.export.export_final_audio")
+    @patch("py_screenalytics.audio.io.get_audio_duration")
+    @patch("py_screenalytics.audio.io.compute_snr")
     def test_pipeline_produces_all_artifacts(
         self,
         mock_compute_snr,
@@ -107,7 +107,16 @@ class TestAudioPipelineE2E:
             DiarizationSegment(start=0.0, end=30.0, speaker="SPEAKER_00", confidence=0.95),
             DiarizationSegment(start=30.0, end=60.0, speaker="SPEAKER_01", confidence=0.90),
         ]
-        mock_diarize.return_value = diar_segments
+        diar_mock_segments = []
+        for seg in diar_segments:
+            seg_mock = MagicMock()
+            seg_mock.to_standard_segment.return_value = seg
+            diar_mock_segments.append(seg_mock)
+        mock_diarize.return_value = MagicMock(
+            segments=diar_mock_segments,
+            speaker_count=2,
+            overlap_duration=0.0,
+        )
 
         # Mock voice clustering
         voice_clusters = [
@@ -238,7 +247,7 @@ class TestArtifactConsistency:
 
     def test_transcript_cluster_ids_in_clusters(self):
         """All transcript voice_cluster_ids exist in voice_clusters.json."""
-        from py_screanalytics.audio.models import TranscriptRow, VoiceCluster, VoiceClusterSegment
+        from py_screenalytics.audio.models import TranscriptRow, VoiceCluster, VoiceClusterSegment
 
         voice_clusters = [
             VoiceCluster(

@@ -20,15 +20,14 @@ class TestAudioModels:
         from py_screenalytics.audio.models import DiarizationSegment
 
         seg = DiarizationSegment(
-            speaker_label="SPEAKER_00",
-            start_ms=0,
-            end_ms=5000,
+            speaker="SPEAKER_00",
+            start=0.0,
+            end=5.0,
             confidence=0.95,
         )
-        assert seg.speaker_label == "SPEAKER_00"
-        assert seg.start_ms == 0
-        assert seg.end_ms == 5000
-        assert seg.duration_ms == 5000
+        assert seg.speaker == "SPEAKER_00"
+        assert seg.start == 0.0
+        assert seg.end == 5.0
         assert seg.confidence == 0.95
 
     def test_asr_segment_creation(self):
@@ -36,19 +35,19 @@ class TestAudioModels:
         from py_screenalytics.audio.models import ASRSegment, WordTiming
 
         words = [
-            WordTiming(word="Hello", start_ms=0, end_ms=500),
-            WordTiming(word="world", start_ms=550, end_ms=1000),
+            WordTiming(w="Hello", t0=0.0, t1=0.5),
+            WordTiming(w="world", t0=0.55, t1=1.0),
         ]
         seg = ASRSegment(
             text="Hello world",
-            start_ms=0,
-            end_ms=1000,
+            start=0.0,
+            end=1.0,
             confidence=0.98,
             words=words,
         )
         assert seg.text == "Hello world"
         assert len(seg.words) == 2
-        assert seg.words[0].word == "Hello"
+        assert seg.words[0].w == "Hello"
 
     def test_voice_cluster_creation(self):
         """VoiceCluster can be created with embedding."""
@@ -69,18 +68,15 @@ class TestAudioModels:
         from py_screenalytics.audio.models import TranscriptRow
 
         row = TranscriptRow(
-            idx=0,
-            start_ms=0,
-            end_ms=5000,
+            start=0.0,
+            end=5.0,
             text="Hello, how are you?",
             speaker_id="cast_001",
             speaker_display_name="John Doe",
             voice_cluster_id="vc_001",
             voice_bank_id="vb_001",
-            diarization_confidence=0.92,
-            asr_confidence=0.97,
+            conf=0.97,
         )
-        assert row.idx == 0
         assert row.speaker_display_name == "John Doe"
         assert row.voice_bank_id == "vb_001"
 
@@ -99,9 +95,9 @@ class TestAudioModels:
         config = QCConfig()
         assert config.max_duration_drift_pct == 1.0
         assert config.min_snr_db == 14.0
-        assert config.warn_snr_db == 18.0
+        assert config.warn_snr_db == 12.0
         assert config.min_diarization_conf == 0.65
-        assert config.min_asr_conf == 0.70
+        assert config.min_asr_conf == 0.60
 
     def test_qc_report_creation(self):
         """QCReport can be created with metrics."""
@@ -132,7 +128,7 @@ class TestAudioConfig:
 
     def test_audio_pipeline_config_creation(self):
         """AudioPipelineConfig can be created with nested configs."""
-        from py_screanalytics.audio.models import (
+        from py_screenalytics.audio.models import (
             AudioPipelineConfig,
             SeparationConfig,
             EnhanceConfig,

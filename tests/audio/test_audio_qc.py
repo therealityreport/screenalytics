@@ -21,8 +21,8 @@ class TestQCChecks:
 
     def test_duration_drift_ok(self):
         """Duration within threshold passes."""
-        from py_screanalytics.audio.qc import run_qc_checks
-        from py_screanalytics.audio.models import QCConfig, QCStatus
+        from py_screenalytics.audio.qc import run_qc_checks
+        from py_screenalytics.audio.models import QCConfig, QCStatus
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "qc.json"
@@ -50,7 +50,7 @@ class TestQCChecks:
     def test_duration_drift_error(self):
         """Duration exceeding threshold fails."""
         from py_screenalytics.audio.qc import run_qc_checks
-        from py_screanalytics.audio.models import QCConfig, QCStatus
+        from py_screenalytics.audio.models import QCConfig, QCStatus
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "qc.json"
@@ -79,7 +79,7 @@ class TestQCChecks:
     def test_snr_below_minimum(self):
         """SNR below minimum threshold triggers error."""
         from py_screenalytics.audio.qc import run_qc_checks
-        from py_screanalytics.audio.models import QCConfig, QCStatus
+        from py_screenalytics.audio.models import QCConfig, QCStatus
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "qc.json"
@@ -106,7 +106,7 @@ class TestQCChecks:
 
     def test_snr_warning_threshold(self):
         """SNR below warning threshold triggers warning."""
-        from py_screanalytics.audio.qc import run_qc_checks
+        from py_screenalytics.audio.qc import run_qc_checks
         from py_screenalytics.audio.models import QCConfig, QCStatus
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -134,8 +134,8 @@ class TestQCChecks:
 
     def test_qc_report_save_load(self):
         """QC report can be saved and loaded."""
-        from py_screanalytics.audio.qc import run_qc_checks, _load_qc_report
-        from py_screanalytics.audio.models import QCConfig, QCStatus
+        from py_screenalytics.audio.qc import run_qc_checks, _load_qc_report
+        from py_screenalytics.audio.models import QCConfig, QCStatus
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "qc.json"
@@ -171,8 +171,8 @@ class TestQCSummary:
 
     def test_get_qc_summary(self):
         """QC summary dict has expected keys."""
-        from py_screanalytics.audio.qc import get_qc_summary
-        from py_screanalytics.audio.models import QCReport, QCStatus
+        from py_screenalytics.audio.qc import get_qc_summary
+        from py_screenalytics.audio.models import QCReport, QCStatus
 
         report = QCReport(
             ep_id="test-s01e01",

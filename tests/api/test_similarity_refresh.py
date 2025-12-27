@@ -11,6 +11,7 @@ from apps.api.main import app
 from apps.api.services.people import PeopleService
 from apps.api.services.track_reps import generate_track_reps_and_centroids
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from py_screenalytics import run_layout
 
 
 def _write_json(path, payload) -> None:
@@ -39,16 +40,18 @@ def data_root(tmp_path, monkeypatch):
 def test_clusters_summary_updates_after_track_delete(data_root):
     client = TestClient(app)
     ep_id = "demo-s01e01"
+    run_id = "run-1"
     ensure_dirs(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir = run_layout.run_root(ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
-    tracks_path = get_path(ep_id, "tracks")
+    tracks_path = manifests_dir / "tracks.jsonl"
     identities_path = manifests_dir / "identities.json"
     frames_root = get_path(ep_id, "frames_root")
+    run_crops_root = frames_root / "runs" / run_id / "crops"
 
     # Create crops so representative selection passes quality gates.
     for track_id in (1, 2):
-        crop_dir = frames_root / "crops" / f"track_{track_id:04d}"
+        crop_dir = run_crops_root / f"track_{track_id:04d}"
         crop_dir.mkdir(parents=True, exist_ok=True)
         (crop_dir / "frame_000000.jpg").write_bytes(b"x")
 
@@ -79,7 +82,11 @@ def test_clusters_summary_updates_after_track_delete(data_root):
     )
 
     people_service = PeopleService(data_root)
-    person = people_service.create_person("DEMO", name="Test Person", cluster_ids=[f"{ep_id}:id_0001"])
+    person = people_service.create_person(
+        "DEMO",
+        name="Test Person",
+        cluster_ids=[f"{ep_id}:{run_id}:id_0001"],
+    )
     person_id = person["person_id"]
 
     _write_json(
@@ -98,10 +105,13 @@ def test_clusters_summary_updates_after_track_delete(data_root):
         },
     )
 
-    generate_track_reps_and_centroids(ep_id)
+    generate_track_reps_and_centroids(ep_id, run_id=run_id)
 
     def _similarities():
-        resp = client.get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+        resp = client.get(
+            f"/episodes/{ep_id}/people/{person_id}/clusters_summary",
+            params={"run_id": run_id},
+        )
         assert resp.status_code == 200
         payload = resp.json()
         clusters = payload["clusters"]
@@ -115,7 +125,11 @@ def test_clusters_summary_updates_after_track_delete(data_root):
     assert initial_map["track_0002"] == pytest.approx(0.707, rel=0.01)
     assert len(initial_tracks) == 2
 
-    resp = client.request("DELETE", f"/episodes/{ep_id}/tracks/2", json={"delete_faces": True})
+    resp = client.request(
+        "DELETE",
+        f"/episodes/{ep_id}/tracks/2?run_id={run_id}",
+        json={"delete_faces": True},
+    )
     assert resp.status_code == 200
 
     updated_map, updated_tracks = _similarities()

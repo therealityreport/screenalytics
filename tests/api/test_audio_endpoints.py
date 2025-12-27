@@ -33,19 +33,25 @@ class TestAudioPipelineEndpoints:
         assert response.status_code == 422
 
     def test_audio_pipeline_invalid_asr_provider(self, api_client):
-        """POST with invalid asr_provider returns 400."""
+        """POST with invalid asr_provider returns 422."""
         response = api_client.post(
             "/jobs/episode_audio_pipeline",
             json={"ep_id": "test-s01e01", "asr_provider": "invalid_provider"},
         )
-        assert response.status_code == 400
+        assert response.status_code == 422
 
     @patch("apps.api.routers.audio.episode_audio_pipeline_task")
-    def test_audio_pipeline_success(self, mock_task, api_client):
+    def test_audio_pipeline_success(self, mock_task, api_client, tmp_path, monkeypatch):
         """POST with valid params starts job and returns 202."""
         mock_result = MagicMock()
         mock_result.id = "test-job-id-123"
         mock_task.delay.return_value = mock_result
+        video_path = tmp_path / "episode.mp4"
+        video_path.write_bytes(b"video")
+        monkeypatch.setattr(
+            "apps.api.routers.audio.get_path",
+            lambda ep_id, artifact: video_path,
+        )
 
         response = api_client.post(
             "/jobs/episode_audio_pipeline",

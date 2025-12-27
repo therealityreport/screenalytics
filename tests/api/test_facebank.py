@@ -21,7 +21,7 @@ from apps.api.services.cast import CastService
 from apps.api.services.people import PeopleService
 
 
-def _create_test_image(size=(112, 112)):
+def _create_test_image(size=(256, 256)):
     """Create a simple test image with a face-like pattern."""
     from PIL import Image, ImageDraw
 
@@ -64,7 +64,7 @@ def _create_test_image(size=(112, 112)):
     return stream
 
 
-def _create_webp_image(size=(112, 112)):
+def _create_webp_image(size=(256, 256)):
     """Create a simple RGB image encoded as WEBP."""
     from PIL import Image
 
@@ -561,7 +561,7 @@ def test_upload_seed_rejects_small_face_when_detector_real(tmp_path, monkeypatch
     files = [("files", ("seed.jpg", _create_test_image(), "image/jpeg"))]
     resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)
     assert resp.status_code == 422
-    assert "Face too small" in resp.json()["detail"]
+    assert "Face too small" in resp.json()["message"]
 
 
 def test_upload_seed_uses_largest_face(tmp_path, monkeypatch):
