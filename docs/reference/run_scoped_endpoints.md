@@ -1,6 +1,6 @@
 # Run-Scoped Endpoint Inventory (Auto-Generated)
 
-Generated: 2025-12-27T17:46:16Z
+Generated: 2025-12-27T18:57:12Z
 
 This table is generated from FastAPI routes at runtime. Columns `reads/writes/artifact_pointers` are heuristic.
 
