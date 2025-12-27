@@ -946,14 +946,41 @@ class JobService:
         if preset:
             command += ["--preset", preset]
             requested["preset"] = preset
+        if run_id_norm:
+            requested["run_stage"] = "screentime"
 
-        return self._launch_job(
+        record = self._launch_job(
             job_type="screen_time_analyze",
             ep_id=ep_id,
             command=command,
             progress_path=progress_path,
             requested=requested,
         )
+        if run_id_norm:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_params = dict(requested)
+                run_params.pop("run_stage", None)
+                run_params.pop("run_id", None)
+                run_state_service.update_stage(
+                    ep_id=ep_id,
+                    run_id=run_id_norm,
+                    stage="screentime",
+                    state="running",
+                    progress=0.0,
+                    job_id=record.get("job_id"),
+                    params=run_params,
+                    source="job_service",
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "[%s] Run state update (screen_time start) skipped for run_id=%s: %s",
+                    ep_id,
+                    run_id_norm,
+                    exc,
+                )
+        return record
 
     def start_body_tracking_job(
         self,
@@ -1317,9 +1344,47 @@ class JobService:
                 record["error"] = f"episode_run exited with code {return_code}"
 
         try:
-            self._mutate_job(job_id, _apply)
+            record = self._mutate_job(job_id, _apply)
         except JobNotFoundError:
             return
+        requested = record.get("requested") if isinstance(record, dict) else None
+        run_id = requested.get("run_id") if isinstance(requested, dict) else None
+        run_stage = requested.get("run_stage") if isinstance(requested, dict) else None
+        ep_id = record.get("ep_id") if isinstance(record, dict) else None
+        if run_id and run_stage and ep_id:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=str(ep_id),
+                    run_id=run_id,
+                    stage=str(run_stage),
+                    state="done" if state == "succeeded" else "failed",
+                    progress=1.0 if state == "succeeded" else None,
+                    last_error=record.get("error"),
+                    job_id=record.get("job_id"),
+                    source="job_service",
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "[%s] Run state update skipped for run_id=%s: %s",
+                    ep_id,
+                    run_id,
+                    exc,
+                )
+            try:
+                from apps.api.routers.episodes import _episode_run_status
+                from apps.api.services.run_state import run_state_service
+
+                snapshot = _episode_run_status(str(ep_id), str(run_id)).model_dump()
+                snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                run_state_service.update_status_snapshot(
+                    ep_id=str(ep_id),
+                    run_id=str(run_id),
+                    status_snapshot=snapshot,
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def get(self, job_id: str) -> JobRecord:
