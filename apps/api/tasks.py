@@ -936,6 +936,27 @@ class PipelineTask(Task):
         LOGGER.info(f"[{job_id}] Starting {operation} for {episode_id}")
         LOGGER.info(f"[{job_id}] Command: {' '.join(command)}")
 
+        if run_id:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=episode_id,
+                    run_id=run_id,
+                    stage=operation,
+                    state="running",
+                    progress=0.0,
+                    job_id=job_id,
+                    source="celery",
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "[%s] Run state update (start) skipped for run_id=%s: %s",
+                    episode_id,
+                    run_id,
+                    exc,
+                )
+
         try:
             # Use Popen for non-blocking execution with real-time progress
             proc = subprocess.Popen(
@@ -1021,6 +1042,26 @@ class PipelineTask(Task):
                                 f"[{job_id}] Progress update: {phase} {frames_done}/{frames_total} "
                                 f"({progress_pct*100:.1f}%)"
                             )
+                            if run_id:
+                                try:
+                                    from apps.api.services.run_state import run_state_service
+
+                                    run_state_service.update_stage(
+                                        ep_id=episode_id,
+                                        run_id=run_id,
+                                        stage=operation,
+                                        state="running",
+                                        progress=progress_pct,
+                                        job_id=job_id,
+                                        source="celery",
+                                    )
+                                except Exception as exc:
+                                    LOGGER.debug(
+                                        "[%s] Run state update (progress) skipped for run_id=%s: %s",
+                                        episode_id,
+                                        run_id,
+                                        exc,
+                                    )
                     except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
                         LOGGER.debug(f"[{job_id}] Could not read progress file: {e}")
 
@@ -1088,11 +1129,13 @@ class PipelineTask(Task):
                 "error": str(e),
             }
         finally:
-            if run_id and job_run_id:
+            if run_id:
                 status_value = final_status_value or "failed"
                 error_text = final_error_text
                 elapsed_s = max(0.0, time.time() - job_started_at)
                 finished_at = datetime.now(timezone.utc)
+
+            if run_id and job_run_id:
                 try:
                     from py_screenalytics import run_layout
 
@@ -1164,14 +1207,37 @@ class PipelineTask(Task):
                         exc,
                     )
 
-                # Update stage_state_json snapshot for the run.
+            if run_id:
+                try:
+                    from apps.api.services.run_state import run_state_service
+
+                    run_state_service.update_stage(
+                        ep_id=episode_id,
+                        run_id=run_id,
+                        stage=operation,
+                        state="done" if status_value == "succeeded" else "failed",
+                        progress=1.0 if status_value == "succeeded" else None,
+                        last_error=error_text,
+                        job_id=job_id,
+                        source="celery",
+                    )
+                except Exception as exc:
+                    LOGGER.debug(
+                        "[%s] Run state update (final) skipped for run_id=%s: %s",
+                        episode_id,
+                        run_id,
+                        exc,
+                    )
+
+            # Update status snapshot for the run.
+            if run_id:
                 try:
                     from apps.api.routers.episodes import _episode_run_status
-                    from apps.api.services.run_persistence import run_persistence_service
+                    from apps.api.services.run_state import run_state_service
 
                     snapshot = _episode_run_status(episode_id, run_id).model_dump()
                     snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                    run_persistence_service.update_run_stage_state(run_id=run_id, stage_state_json=snapshot)
+                    run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id, status_snapshot=snapshot)
                 except Exception as exc:
                     LOGGER.debug(
                         "[%s] Stage snapshot update skipped for run_id=%s: %s",

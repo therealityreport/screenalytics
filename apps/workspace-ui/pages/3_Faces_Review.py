@@ -1148,6 +1148,95 @@ def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, A
         return None
 
 
+def _trigger_run_stage_job(
+    ep_id: str,
+    stage: str,
+    params: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    payload = {"params": params or {}}
+    return _api_post(f"/episodes/{ep_id}/runs/{_CURRENT_RUN_ID}/jobs/{stage}", payload)
+
+
+def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, Any]) -> None:
+    if not run_id:
+        return
+    run_state = bundle.get("run_state") or {}
+    validation = bundle.get("validation") or {}
+    if not run_state:
+        st.info("Run status unavailable for this attempt.")
+        return
+
+    st.subheader("Run Status / Health")
+    stages = run_state.get("stages") or {}
+    stage_order = [
+        ("detect_track", "Detect/Track"),
+        ("faces_embed", "Faces Embed"),
+        ("cluster", "Cluster"),
+        ("screentime", "Screentime"),
+        ("export", "Export"),
+    ]
+
+    def _stage_label(state_value: str | None) -> str:
+        value = (state_value or "pending").lower()
+        badge = {
+            "pending": "⏳",
+            "queued": "⏸",
+            "running": "🚧",
+            "done": "✅",
+            "failed": "❌",
+        }.get(value, "⏳")
+        return f"{badge} {value}"
+
+    for stage_key, stage_label in stage_order:
+        entry = stages.get(stage_key) or {}
+        state_value = entry.get("state")
+        progress_value = entry.get("progress")
+        last_error = entry.get("last_error")
+        col_label, col_status, col_action = st.columns([2, 2, 2])
+        with col_label:
+            st.write(stage_label)
+        with col_status:
+            if isinstance(progress_value, (int, float)) and state_value in {"running", "queued"}:
+                st.write(f"{_stage_label(state_value)} ({progress_value * 100:.0f}%)")
+            else:
+                st.write(_stage_label(state_value))
+            if last_error and state_value == "failed":
+                st.caption(str(last_error)[:200])
+        with col_action:
+            if state_value in {None, "pending", "failed"}:
+                button_label = "Retry" if state_value == "failed" else "Run"
+                if st.button(f"{button_label} {stage_label}", key=f"run_stage_{stage_key}"):
+                    resp = _trigger_run_stage_job(ep_id, stage_key)
+                    if resp and resp.get("status") in {"queued", "existing"}:
+                        st.success(f"{stage_label} job queued.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to start job. See API logs.")
+
+    summary = validation.get("summary") if isinstance(validation, dict) else None
+    if isinstance(summary, dict):
+        error_count = int(summary.get("error_count", 0) or 0)
+        warning_count = int(summary.get("warning_count", 0) or 0)
+        if error_count:
+            st.error(f"Validator found {error_count} blocking issue(s).")
+        elif warning_count:
+            st.warning(f"Validator found {warning_count} warning(s).")
+        else:
+            st.success("Validator checks look good.")
+    if validation:
+        with st.expander("Validator details", expanded=False):
+            errors = validation.get("errors", [])
+            warnings = validation.get("warnings", [])
+            if errors:
+                st.write("Errors")
+                for entry in errors:
+                    st.write(f"- {entry.get('code')}: {entry.get('message')}")
+            if warnings:
+                st.write("Warnings")
+                for entry in warnings:
+                    st.write(f"- {entry.get('code')}: {entry.get('message')}")
+
+
 def _episode_show_slug(ep_id: str) -> str | None:
     parsed = helpers.parse_ep_id(ep_id) or {}
     show = parsed.get("show")
@@ -6958,6 +7047,8 @@ people = bundle.get("people") or []
 archived_sets = bundle.get("archived_ids") or {}
 cast_options = bundle.get("cast_options") or {}
 legacy_people_fallback = bool(bundle.get("legacy_people_fallback"))
+
+_render_run_status_panel(ep_id, _CURRENT_RUN_ID, bundle)
 
 if not identities_payload:
     st.error("Failed to load identities data. Please check that the API is running and the episode has been processed.")

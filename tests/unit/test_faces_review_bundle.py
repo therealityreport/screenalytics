@@ -360,3 +360,29 @@ def test_bundle_cast_gallery_run_scoped(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     assert bundle_one["cast_gallery_cards"][0]["episode_clusters"] == ["c1"]
     assert bundle_two["cast_gallery_cards"][0]["episode_clusters"] == ["c2"]
+
+
+def test_bundle_includes_run_state_and_validation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+    ep_id = "demo-s01e01"
+    _write_run_artifacts(
+        ep_id,
+        RUN_ID,
+        identities=[{"identity_id": "c1", "track_ids": [1]}],
+        tracks=[{"track_id": 1, "faces_count": 1}],
+        faces=[{"face_id": "f1", "track_id": 1, "frame_idx": 1}],
+    )
+    from apps.api.services.run_state import run_state_service
+
+    run_state_service.update_stage(
+        ep_id=ep_id,
+        run_id=RUN_ID,
+        stage="detect_track",
+        state="done",
+        progress=1.0,
+    )
+
+    bundle = bundle_mod.build_faces_review_bundle(ep_id, RUN_ID, data_root=tmp_path)
+    assert bundle.get("run_state") is not None
+    assert bundle.get("validation") is not None

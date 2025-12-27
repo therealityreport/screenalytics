@@ -2439,6 +2439,26 @@ def _stream_local_subprocess(
         _register_local_job(episode_id, operation, process.pid, job_id=None)
         pid_msg = f"[INFO] Process started (PID {process.pid})"
         yield _emit_formatted(pid_msg, pid_msg)
+        if run_id_norm:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=episode_id,
+                    run_id=run_id_norm,
+                    stage=operation,
+                    state="running",
+                    progress=0.0,
+                    job_id=str(job_run_id or f"pid:{process.pid}"),
+                    source="local",
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "[%s] Run state update (start) skipped for run_id=%s: %s",
+                    episode_id,
+                    run_id_norm,
+                    exc,
+                )
 
         # Stream stdout lines as they arrive, applying formatting
         assert process.stdout is not None
@@ -2464,20 +2484,30 @@ def _stream_local_subprocess(
                     "error": f"Job timed out after {timeout} seconds",
                 }) + "\n"
 
-                if run_id_norm and job_run_id:
-                    try:
-                        from apps.api.services.run_persistence import run_persistence_service
+            if run_id_norm and job_run_id:
+                try:
+                    from apps.api.services.run_persistence import run_persistence_service
 
-                        run_persistence_service.update_job_run(
+                    run_persistence_service.update_job_run(
                             job_run_id=job_run_id,
                             status="failed",
                             finished_at=datetime.now(timezone.utc),
                             error_text=f"timeout after {timeout}s",
-                            metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "timeout_s": timeout},
-                        )
-                    except Exception:
-                        pass
-                return
+                        metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "timeout_s": timeout},
+                    )
+                except Exception:
+                    pass
+            if run_id_norm:
+                try:
+                    from apps.api.routers.episodes import _episode_run_status
+                    from apps.api.services.run_state import run_state_service
+
+                    snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
+                    snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id_norm, status_snapshot=snapshot)
+                except Exception:
+                    pass
+            return
 
             stripped = raw_line.rstrip()
             if not stripped:
@@ -2522,6 +2552,35 @@ def _stream_local_subprocess(
                                 "fps_infer": progress_data.get("fps_infer"),
                                 "secs_done": progress_data.get("secs_done", 0),
                             }) + "\n"
+                            if run_id_norm:
+                                try:
+                                    frames_done = int(progress_data.get("frames_done", 0))
+                                    frames_total = int(progress_data.get("frames_total", 0))
+                                except (TypeError, ValueError):
+                                    frames_done = 0
+                                    frames_total = 0
+                                progress_pct = None
+                                if frames_total > 0:
+                                    progress_pct = min(frames_done / frames_total, 0.99)
+                                try:
+                                    from apps.api.services.run_state import run_state_service
+
+                                    run_state_service.update_stage(
+                                        ep_id=episode_id,
+                                        run_id=run_id_norm,
+                                        stage=operation,
+                                        state="running",
+                                        progress=progress_pct if progress_pct is not None else 0.0,
+                                        job_id=str(job_run_id or f"pid:{process.pid}"),
+                                        source="local",
+                                    )
+                                except Exception as exc:
+                                    LOGGER.debug(
+                                        "[%s] Run state update (progress) skipped for run_id=%s: %s",
+                                        episode_id,
+                                        run_id_norm,
+                                        exc,
+                                    )
                         # Also format and show in logs
                         formatted_line = formatter.format_line(stripped)
                         if formatted_line:
@@ -2607,6 +2666,30 @@ def _stream_local_subprocess(
                     )
                 except Exception:
                     pass
+            if run_id_norm:
+                try:
+                    from apps.api.services.run_state import run_state_service
+
+                    run_state_service.update_stage(
+                        ep_id=episode_id,
+                        run_id=run_id_norm,
+                        stage=operation,
+                        state="failed",
+                        last_error=error_msg,
+                        job_id=str(job_run_id or f"pid:{process.pid}"),
+                        source="local",
+                    )
+                except Exception:
+                    pass
+                try:
+                    from apps.api.routers.episodes import _episode_run_status
+                    from apps.api.services.run_state import run_state_service
+
+                    snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
+                    snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id_norm, status_snapshot=snapshot)
+                except Exception:
+                    pass
             return
 
         # Success - emit completion summary
@@ -2653,6 +2736,21 @@ def _stream_local_subprocess(
                     finished_at=datetime.now(timezone.utc),
                     artifact_index_json=artifact_index,
                     metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "return_code": 0},
+                )
+            except Exception:
+                pass
+        if run_id_norm:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=episode_id,
+                    run_id=run_id_norm,
+                    stage=operation,
+                    state="done",
+                    progress=1.0,
+                    job_id=str(job_run_id or f"pid:{process.pid}"),
+                    source="local",
                 )
             except Exception:
                 pass
@@ -2707,11 +2805,11 @@ def _stream_local_subprocess(
         if run_id_norm:
             try:
                 from apps.api.routers.episodes import _episode_run_status
-                from apps.api.services.run_persistence import run_persistence_service
+                from apps.api.services.run_state import run_state_service
 
                 snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
                 snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                run_persistence_service.update_run_stage_state(run_id=run_id_norm, stage_state_json=snapshot)
+                run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id_norm, status_snapshot=snapshot)
             except Exception:
                 pass
 
@@ -2740,6 +2838,30 @@ def _stream_local_subprocess(
                     error_text="cancelled: client disconnected",
                     metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "cancelled": True},
                 )
+            except Exception:
+                pass
+        if run_id_norm:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=episode_id,
+                    run_id=run_id_norm,
+                    stage=operation,
+                    state="failed",
+                    last_error="cancelled: client disconnected",
+                    job_id=str(job_run_id or f"pid:{process.pid}" if process else ""),
+                    source="local",
+                )
+            except Exception:
+                pass
+            try:
+                from apps.api.routers.episodes import _episode_run_status
+                from apps.api.services.run_state import run_state_service
+
+                snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
+                snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id_norm, status_snapshot=snapshot)
             except Exception:
                 pass
         raise
@@ -2771,6 +2893,30 @@ def _stream_local_subprocess(
                     error_text=error_msg,
                     metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed},
                 )
+            except Exception:
+                pass
+        if run_id_norm:
+            try:
+                from apps.api.services.run_state import run_state_service
+
+                run_state_service.update_stage(
+                    ep_id=episode_id,
+                    run_id=run_id_norm,
+                    stage=operation,
+                    state="failed",
+                    last_error=error_msg,
+                    job_id=str(job_run_id or f"pid:{process.pid}" if process else ""),
+                    source="local",
+                )
+            except Exception:
+                pass
+            try:
+                from apps.api.routers.episodes import _episode_run_status
+                from apps.api.services.run_state import run_state_service
+
+                snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
+                snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                run_state_service.update_status_snapshot(ep_id=episode_id, run_id=run_id_norm, status_snapshot=snapshot)
             except Exception:
                 pass
 
