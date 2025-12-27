@@ -1168,6 +1168,8 @@ def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, A
 
     st.subheader("Run Status / Health")
     stages = run_state.get("stages") or {}
+    artifacts = run_state.get("artifacts") or {}
+    faces_artifacts = artifacts.get("faces") or {}
     stage_order = [
         ("detect_track", "Detect/Track"),
         ("faces_embed", "Faces Embed"),
@@ -1213,16 +1215,30 @@ def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, A
                     else:
                         st.error("Failed to start job. See API logs.")
 
+    faces_source = faces_artifacts.get("source") or "unknown"
+    faces_manifest_path = faces_artifacts.get("manifest_path") or faces_artifacts.get("path")
+    faces_manifest_exists = faces_artifacts.get("manifest_exists")
+    if faces_manifest_exists is None:
+        faces_manifest_exists = faces_artifacts.get("exists")
+    if faces_manifest_path:
+        st.caption(
+            f"Faces source: {faces_source} · manifest: {faces_manifest_path} "
+            f"({'present' if faces_manifest_exists else 'missing'})"
+        )
+
     summary = validation.get("summary") if isinstance(validation, dict) else None
     if isinstance(summary, dict):
         error_count = int(summary.get("error_count", 0) or 0)
         warning_count = int(summary.get("warning_count", 0) or 0)
+        unclustered_tracks = int(summary.get("unclustered_tracks", 0) or 0)
         if error_count:
             st.error(f"Validator found {error_count} blocking issue(s).")
         elif warning_count:
             st.warning(f"Validator found {warning_count} warning(s).")
         else:
             st.success("Validator checks look good.")
+        if unclustered_tracks:
+            st.info(f"Unclustered tracks: {unclustered_tracks}")
     if validation:
         with st.expander("Validator details", expanded=False):
             errors = validation.get("errors", [])
@@ -1235,6 +1251,14 @@ def _render_run_status_panel(ep_id: str, run_id: str | None, bundle: Dict[str, A
                 st.write("Warnings")
                 for entry in warnings:
                     st.write(f"- {entry.get('code')}: {entry.get('message')}")
+            if isinstance(summary, dict):
+                by_reason = summary.get("unclustered_tracks_by_reason") or {}
+                sample_tracks = summary.get("unclustered_track_samples") or []
+                if by_reason:
+                    st.write("Unclustered breakdown")
+                    st.write(by_reason)
+                if sample_tracks:
+                    st.write(f"Sample unclustered tracks: {', '.join(str(tid) for tid in sample_tracks)}")
 
 
 def _episode_show_slug(ep_id: str) -> str | None:

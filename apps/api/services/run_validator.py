@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
+
+from apps.api.services.run_state import run_state_service
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +44,17 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 if isinstance(row, dict):
                     yield row
     return _generator()
+
+
+def _parse_track_id(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.replace("track_", "")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _crop_exists(
@@ -108,11 +120,42 @@ def validate_run_integrity(
     identities_path = run_root / "identities.json"
     reps_path = run_root / "track_reps.jsonl"
 
+    artifact_pointers: Dict[str, Any] = {}
+    faces_artifacts: Dict[str, Any] = {}
+    try:
+        run_state_bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id_norm)
+        run_state_payload = run_state_bundle.get("run_state") if isinstance(run_state_bundle, dict) else None
+        if isinstance(run_state_payload, dict):
+            artifact_pointers = run_state_payload.get("artifacts") if isinstance(run_state_payload.get("artifacts"), dict) else {}
+            faces_artifacts = artifact_pointers.get("faces") if isinstance(artifact_pointers.get("faces"), dict) else {}
+    except Exception as exc:
+        LOGGER.debug("Run state lookup failed for validator (%s/%s): %s", ep_id, run_id_norm, exc)
+        artifact_pointers = {}
+        faces_artifacts = {}
+
+    faces_source = faces_artifacts.get("source")
+    faces_manifest_path = faces_artifacts.get("manifest_path") or str(faces_path)
+    faces_manifest_key = faces_artifacts.get("manifest_key") or faces_artifacts.get("s3_key")
+    faces_manifest_exists = faces_artifacts.get("manifest_exists")
+    if faces_manifest_exists is None:
+        faces_manifest_exists = faces_path.exists()
+    if faces_source is None:
+        if faces_manifest_exists:
+            faces_source = "manifest"
+        elif reps_path.exists() or (Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser() / "embeds" / ep_id / "runs" / run_id_norm / "faces.npy").exists():
+            faces_source = "embeddings"
+        elif tracks_path.exists():
+            faces_source = "tracks"
+
     track_ids: Set[int] = set()
+    track_rows: Dict[int, Dict[str, Any]] = {}
     face_ids: Set[str] = set()
     identity_ids: Set[str] = set()
     identity_track_ids: Set[int] = set()
     rep_track_ids: Set[int] = set()
+    rep_lookup: Dict[int, Dict[str, Any]] = {}
+    faces_estimate = 0
+    faces_estimate_present = False
     missing_tracks_for_faces = 0
     missing_tracks_for_identities = 0
     missing_tracks_for_reps = 0
@@ -128,29 +171,48 @@ def validate_run_integrity(
         )
     else:
         for row in _iter_jsonl(tracks_path):
-            raw = row.get("track_id") or row.get("track")
-            try:
-                track_id = int(raw)
-            except (TypeError, ValueError):
+            track_id = _parse_track_id(row.get("track_id") or row.get("track"))
+            if track_id is None:
                 continue
             track_ids.add(track_id)
+            track_rows[track_id] = row
+            faces_count = row.get("faces_count")
+            if faces_count is not None:
+                try:
+                    faces_estimate += int(faces_count)
+                    faces_estimate_present = True
+                except (TypeError, ValueError):
+                    pass
         stats["tracks"] = len(track_ids)
 
-    if not faces_path.exists():
-        errors.append(
-            {
-                "code": "missing_faces",
-                "message": "faces.jsonl is missing for this run.",
-                "details": {"path": str(faces_path)},
-            }
-        )
+    if not faces_manifest_exists:
+        if faces_source in (None, "manifest"):
+            errors.append(
+                {
+                    "code": "missing_faces",
+                    "message": "faces.jsonl is missing for this run.",
+                    "details": {
+                        "path": faces_manifest_path,
+                        "faces_source": faces_source,
+                        "manifest_key": faces_manifest_key,
+                    },
+                }
+            )
+        else:
+            warnings.append(
+                {
+                    "code": "faces_manifest_missing",
+                    "message": "faces.jsonl is missing; using alternate faces source.",
+                    "details": {
+                        "path": faces_manifest_path,
+                        "faces_source": faces_source,
+                        "manifest_key": faces_manifest_key,
+                    },
+                }
+            )
     else:
         for row in _iter_jsonl(faces_path):
-            raw_track = row.get("track_id") or row.get("track")
-            try:
-                track_id = int(raw_track)
-            except (TypeError, ValueError):
-                track_id = None
+            track_id = _parse_track_id(row.get("track_id") or row.get("track"))
             if track_id is not None and track_id not in track_ids and track_ids:
                 missing_tracks_for_faces += 1
             face_id = row.get("face_id")
@@ -190,13 +252,10 @@ def validate_run_integrity(
 
     if reps_path.exists():
         for row in _iter_jsonl(reps_path):
-            raw_track = row.get("track_id") or row.get("track")
-            try:
-                track_id = int(raw_track)
-            except (TypeError, ValueError):
-                track_id = None
+            track_id = _parse_track_id(row.get("track_id") or row.get("track"))
             if track_id is not None:
                 rep_track_ids.add(track_id)
+                rep_lookup[track_id] = row
                 if track_id not in track_ids and track_ids:
                     missing_tracks_for_reps += 1
 
@@ -232,14 +291,49 @@ def validate_run_integrity(
             }
         )
 
+    unclustered_by_reason: Dict[str, List[int]] = {}
     if track_ids and identity_track_ids:
         missing_cluster_refs = track_ids - identity_track_ids
         if missing_cluster_refs:
+            reps_present = reps_path.exists()
+            for track_id in sorted(missing_cluster_refs):
+                reason = "not_in_identities"
+                track_row = track_rows.get(track_id, {})
+                frame_count = track_row.get("frame_count") or track_row.get("frames")
+                try:
+                    if frame_count is not None and int(frame_count) <= 1:
+                        reason = "filtered_single_frame"
+                except (TypeError, ValueError):
+                    pass
+                if reason == "not_in_identities":
+                    if track_row.get("excluded") or track_row.get("excluded_reason") or track_row.get("filtered_reason") or track_row.get("skip_reason"):
+                        reason = "excluded_by_params"
+                if reason == "not_in_identities":
+                    rep = rep_lookup.get(track_id)
+                    if rep and rep.get("no_embeddings"):
+                        reason = "missing_embeddings"
+                    elif reps_present and track_id not in rep_lookup:
+                        reason = "missing_embeddings"
+
+                unclustered_by_reason.setdefault(reason, []).append(track_id)
+
+            samples: List[int] = []
+            for reason_tracks in unclustered_by_reason.values():
+                for tid in reason_tracks:
+                    samples.append(tid)
+                    if len(samples) >= 10:
+                        break
+                if len(samples) >= 10:
+                    break
             warnings.append(
                 {
                     "code": "tracks_without_clusters",
                     "message": "Some tracks are not assigned to any cluster identity.",
-                    "details": {"count": len(missing_cluster_refs)},
+                    "details": {
+                        "count": len(missing_cluster_refs),
+                        "by_reason": {k: len(v) for k, v in unclustered_by_reason.items()},
+                        "sample_track_ids": samples,
+                    },
                 }
             )
 
@@ -321,6 +415,9 @@ def validate_run_integrity(
         except Exception as exc:  # pragma: no cover - best effort
             LOGGER.debug("Embedding check skipped: %s", exc)
 
+    if faces_estimate_present and not stats.get("faces"):
+        stats["faces_estimate"] = faces_estimate
+
     return {
         "ep_id": ep_id,
         "run_id": run_id_norm,
@@ -328,10 +425,22 @@ def validate_run_integrity(
         "errors": errors,
         "warnings": warnings,
         "stats": stats,
+        "artifact_pointers": {
+            "faces": {
+                "source": faces_source,
+                "manifest_path": faces_manifest_path,
+                "manifest_key": faces_manifest_key,
+                "manifest_exists": faces_manifest_exists,
+                "exists": faces_artifacts.get("exists") if faces_artifacts else None,
+            }
+        },
         "summary": {
             "blocking": len(errors) > 0,
             "error_count": len(errors),
             "warning_count": len(warnings),
             "blocking_issues": [err.get("code") for err in errors],
+            "unclustered_tracks": sum(len(v) for v in unclustered_by_reason.values()) if unclustered_by_reason else 0,
+            "unclustered_tracks_by_reason": {k: len(v) for k, v in unclustered_by_reason.items()},
+            "unclustered_track_samples": [tid for tids in unclustered_by_reason.values() for tid in tids[:3]][:10],
         },
     }
