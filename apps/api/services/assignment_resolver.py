@@ -12,6 +12,7 @@ def _normalize_assignment_entry(entry: Dict[str, Any] | None, *, assignment_type
             "source": None,
             "updated_at": None,
             "updated_by": None,
+            "unassigned": False,
             "assignment_type": assignment_type,
         }
     assigned_by = entry.get("assigned_by")
@@ -27,6 +28,7 @@ def _normalize_assignment_entry(entry: Dict[str, Any] | None, *, assignment_type
         "source": source,
         "updated_at": updated_at,
         "updated_by": entry.get("updated_by"),
+        "unassigned": bool(entry.get("unassigned")),
         "assignment_type": assignment_type,
     }
 

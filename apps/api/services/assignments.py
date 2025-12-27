@@ -119,6 +119,7 @@ def _apply_assignment_update(
     cast_id: str | None,
     source: str,
     updated_by: str | None,
+    unassigned: bool | None = None,
 ) -> Tuple[Dict[str, Any], bool]:
     entry = dict(existing or {})
     assigned_by = entry.get("assigned_by")
@@ -130,6 +131,8 @@ def _apply_assignment_update(
     new_entry["cast_id"] = cast_id
     new_entry["assigned_by"] = assigned_by
     new_entry["source"] = source
+    if unassigned is not None:
+        new_entry["unassigned"] = unassigned
     if updated_by is not None:
         new_entry["updated_by"] = updated_by
     if new_entry.get("updated_at") is None:
@@ -143,6 +146,7 @@ def _apply_assignment_update(
             and entry.get("source") == new_entry.get("source")
             and entry.get("assigned_by") == new_entry.get("assigned_by")
             and entry.get("updated_by") == new_entry.get("updated_by")
+            and entry.get("unassigned") == new_entry.get("unassigned")
         )
 
     if _matches():
@@ -234,8 +238,15 @@ def set_cluster_assignment(
 
     changed = False
     if not cast_id:
-        if cluster_id in manual_assignments:
-            manual_assignments.pop(cluster_id, None)
+        entry, entry_changed = _apply_assignment_update(
+            manual_assignments.get(cluster_id),
+            cast_id=None,
+            source=source,
+            updated_by=updated_by,
+            unassigned=True,
+        )
+        if entry_changed or cluster_id not in manual_assignments:
+            manual_assignments[cluster_id] = entry
             changed = True
     else:
         entry, entry_changed = _apply_assignment_update(
@@ -243,6 +254,7 @@ def set_cluster_assignment(
             cast_id=cast_id,
             source=source,
             updated_by=updated_by,
+            unassigned=False,
         )
         if entry_changed or cluster_id not in manual_assignments:
             manual_assignments[cluster_id] = entry
@@ -336,7 +348,13 @@ def set_face_exclusion(
             changed = True
     else:
         entry = dict(face_exclusions.get(key) or {})
-        if entry.get("excluded") and entry.get("reason") == reason and entry.get("source") == source and entry.get("updated_by") == updated_by:
+        if (
+            entry.get("excluded")
+            and entry.get("reason") == reason
+            and entry.get("source") == source
+            and entry.get("updated_by") == updated_by
+            and entry.get("track_id") == track_id
+        ):
             return {
                 "changed": False,
                 "assignments": {"faces": face_exclusions},
