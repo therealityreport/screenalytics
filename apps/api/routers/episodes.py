@@ -42,6 +42,11 @@ from apps.api.services.run_export import build_run_debug_bundle_zip
 from apps.api.services.jobs import JobService
 from apps.api.services.run_state import compute_params_hash, run_state_service
 from apps.api.services.run_validator import validate_run_integrity
+from apps.api.services.suggestions import (
+    dismiss_suggestions,
+    get_or_compute_suggestions,
+    load_suggestions,
+)
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -1793,6 +1798,17 @@ class FaceExclusionRequest(BaseModel):
     source: Literal["manual", "auto"] = Field("manual", description="Exclusion source")
     updated_by: str | None = Field(None, description="Optional actor identifier")
     track_id: int | None = Field(None, description="Optional track id context")
+
+
+class SuggestionsComputeRequest(BaseModel):
+    top_k: int = Field(3, ge=1, le=10, description="Number of suggestions per cluster")
+    min_similarity: float | None = Field(None, ge=0.0, le=1.0, description="Minimum similarity threshold")
+    force: bool = Field(False, description="Force recomputation even if cached")
+
+
+class SuggestionsDismissRequest(BaseModel):
+    suggestion_ids: List[str] = Field(..., description="Suggestion ids to dismiss/restore")
+    restore: bool = Field(False, description="Restore dismissed suggestions instead of dismissing")
 
 
 class IdentityMergeRequest(BaseModel):
@@ -3858,6 +3874,87 @@ def get_faces_review_bundle(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/suggestions")
+def get_run_suggestions(
+    ep_id: str,
+    run_id: str,
+    refresh: bool = Query(False, description="Recompute suggestions before returning"),
+    top_k: int = Query(3, ge=1, le=10, description="Number of suggestions per cluster"),
+    min_similarity: float | None = Query(None, ge=0.0, le=1.0, description="Minimum similarity threshold"),
+) -> dict:
+    _require_s3_storage()
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if not refresh:
+        cached = load_suggestions(ep_id, run_id_norm)
+        if isinstance(cached, dict):
+            return cached
+
+    return get_or_compute_suggestions(
+        ep_id,
+        run_id_norm,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        refresh=True,
+    )
+
+
+@router.post("/episodes/{ep_id}/runs/{run_id}/jobs/suggest_faces")
+def suggest_faces_job(
+    ep_id: str,
+    run_id: str,
+    body: SuggestionsComputeRequest,
+) -> dict:
+    _require_s3_storage()
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if not body.force:
+        cached = load_suggestions(ep_id, run_id_norm)
+        if isinstance(cached, dict):
+            return {
+                "status": "exists",
+                "ep_id": ep_id,
+                "run_id": run_id_norm,
+                "suggestions": cached.get("suggestions", {}),
+                "triage": cached.get("triage", {}),
+            }
+
+    return get_or_compute_suggestions(
+        ep_id,
+        run_id_norm,
+        top_k=body.top_k,
+        min_similarity=body.min_similarity,
+        refresh=True,
+    )
+
+
+@router.post("/episodes/{ep_id}/runs/{run_id}/suggestions/dismiss")
+def dismiss_run_suggestions(
+    ep_id: str,
+    run_id: str,
+    body: SuggestionsDismissRequest,
+) -> dict:
+    _require_s3_storage()
+    try:
+        run_id_norm = _require_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not body.suggestion_ids:
+        raise HTTPException(status_code=400, detail="suggestion_ids required")
+    return dismiss_suggestions(
+        ep_id,
+        run_id_norm,
+        body.suggestion_ids,
+        restore=body.restore,
+    )
 
 
 @router.get("/episodes/{ep_id}/assignments")

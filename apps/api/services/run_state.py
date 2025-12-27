@@ -109,6 +109,9 @@ def _build_artifact_pointers(ep_id: str, run_id: str) -> Dict[str, Any]:
             s3_key=tracks_key,
         ),
         "faces": faces_entry,
+        "suggestions": _artifact_entry(
+            s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "suggestions.json"),
+        ),
         "identities": _artifact_entry(
             s3_key=identities_key,
         ),

@@ -16,6 +16,7 @@ from apps.api.services.cast import CastService
 from apps.api.services.grouping import GroupingService
 from apps.api.services.identities import cluster_track_summary, load_identities
 from apps.api.services.people import PeopleService
+from apps.api.services.suggestions import get_or_compute_suggestions
 from apps.api.services.run_state import run_state_service
 from apps.api.services.run_validator import validate_run_integrity
 
@@ -329,6 +330,23 @@ def build_faces_review_bundle(
             filtered_entities.append(entry)
         unlinked_entities = filtered_entities
 
+    assigned_clusters = {
+        str(cluster_id)
+        for cluster_id, entry in cluster_assignments.items()
+        if isinstance(entry, dict) and entry.get("cast_id")
+    }
+    if assigned_clusters:
+        filtered_entities = []
+        for entity in unlinked_entities:
+            cluster_ids = [cid for cid in (entity.get("cluster_ids") or []) if cid]
+            remaining_clusters = [cid for cid in cluster_ids if cid not in assigned_clusters]
+            if not remaining_clusters:
+                continue
+            entry = dict(entity)
+            entry["cluster_ids"] = remaining_clusters
+            filtered_entities.append(entry)
+        unlinked_entities = filtered_entities
+
     if filter_cast_id:
         people = [
             person for person in people
@@ -410,6 +428,7 @@ def build_faces_review_bundle(
     run_state_payload: Dict[str, Any] | None = None
     status_snapshot: Dict[str, Any] | None = None
     validation_payload: Dict[str, Any] | None = None
+    suggestions_payload: Dict[str, Any] | None = None
     if run_id_norm:
         try:
             run_state_bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id_norm)
@@ -421,6 +440,39 @@ def build_faces_review_bundle(
             validation_payload = validate_run_integrity(ep_id, run_id_norm, data_root=data_root)
         except Exception as exc:
             LOGGER.debug("[faces-review-bundle] validator unavailable for %s/%s: %s", ep_id, run_id_norm, exc)
+        try:
+            suggestions_payload = get_or_compute_suggestions(ep_id, run_id_norm)
+        except Exception as exc:
+            LOGGER.debug("[faces-review-bundle] suggestions unavailable for %s/%s: %s", ep_id, run_id_norm, exc)
+            suggestions_payload = {
+                "status": "error",
+                "message": "Failed to load suggestions",
+                "suggestions": {},
+                "triage": {},
+            }
+
+    if isinstance(suggestions_payload, dict):
+        suggestions = suggestions_payload.get("suggestions")
+        dismissed = suggestions_payload.get("dismissed")
+        dismissed_set = set(dismissed) if isinstance(dismissed, list) else set()
+        if isinstance(suggestions, dict):
+            for cluster_id, entries in list(suggestions.items()):
+                if not isinstance(entries, list):
+                    continue
+                filtered_entries = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    suggestion_id = entry.get("suggestion_id") or f"{cluster_id}:{entry.get('cast_id')}"
+                    if suggestion_id in dismissed_set:
+                        continue
+                    cast_id = entry.get("cast_id")
+                    if cast_id and cast_id in cast_options and not entry.get("name"):
+                        entry = dict(entry)
+                        entry["name"] = cast_options.get(cast_id)
+                    filtered_entries.append(entry)
+                suggestions[cluster_id] = filtered_entries
+            suggestions_payload["suggestions"] = suggestions
 
     return {
         "ep_id": ep_id,
@@ -442,6 +494,7 @@ def build_faces_review_bundle(
         "run_state": run_state_payload,
         "status_snapshot": status_snapshot,
         "validation": validation_payload,
+        "suggestions": suggestions_payload or {},
         "cluster_payload": cluster_payload,
         "identities": identities_payload,
     }

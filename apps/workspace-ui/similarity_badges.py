@@ -424,6 +424,7 @@ UNASSIGNED_CLUSTER_SORT_OPTIONS = [
     "Face Count (Low to High)",
     "Track Count (High to Low)",
     "Track Count (Low to High)",
+    "Triage (Impact × Uncertainty)",
     "Cast Match Score (High to Low)",
     "Cast Match Score (Low to High)",
     "Cluster Similarity (High to Low)",
