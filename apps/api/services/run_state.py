@@ -86,22 +86,40 @@ def _build_artifact_pointers(ep_id: str, run_id: str) -> Dict[str, Any]:
     exports_root = run_root / "exports"
     analytics_root = run_root / "analytics"
 
+    faces_path = run_root / "faces.jsonl"
+    tracks_path = run_root / "tracks.jsonl"
+    track_reps_path = run_root / "track_reps.jsonl"
+    faces_manifest_exists = faces_path.exists()
+    faces_source: str | None = None
+    if faces_manifest_exists:
+        faces_source = "manifest"
+    elif (embeds_root / "faces.npy").exists() or track_reps_path.exists():
+        faces_source = "embeddings"
+    elif tracks_path.exists():
+        faces_source = "tracks"
+
+    faces_entry = _artifact_entry(
+        faces_path,
+        s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl"),
+    )
+    faces_entry["manifest_path"] = str(faces_path)
+    faces_entry["manifest_key"] = run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl")
+    faces_entry["manifest_exists"] = faces_manifest_exists
+    faces_entry["source"] = faces_source
+
     return {
         "run_root": str(run_root),
         "tracks": _artifact_entry(
-            run_root / "tracks.jsonl",
+            tracks_path,
             s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "tracks.jsonl"),
         ),
-        "faces": _artifact_entry(
-            run_root / "faces.jsonl",
-            s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "faces.jsonl"),
-        ),
+        "faces": faces_entry,
         "identities": _artifact_entry(
             run_root / "identities.json",
             s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "identities.json"),
         ),
         "track_reps": _artifact_entry(
-            run_root / "track_reps.jsonl",
+            track_reps_path,
             s3_key=run_layout.run_artifact_s3_key(ep_id, run_id_norm, "track_reps.jsonl"),
         ),
         "crops": {
