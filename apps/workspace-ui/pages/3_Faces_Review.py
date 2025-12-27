@@ -5497,7 +5497,9 @@ def _render_cluster_tracks(
     st.subheader(f"Cluster {identity_id}")
 
     # Show assigned person info (prefer bundle assignment cast_id)
-    if assigned_cast_id:
+    if isinstance(assignment_meta, dict) and assignment_meta.get("unassigned"):
+        st.caption(":orange[🚫 Cast unassigned (manual override)]")
+    elif assigned_cast_id:
         cast_name = cast_lookup.get(assigned_cast_id, {}).get("name") if cast_lookup else None
         st.caption(f"🎭 Assigned cast: **{cast_name or assigned_cast_id}**")
         source_label = assignment_meta.get("source") if isinstance(assignment_meta, dict) else None
@@ -6002,7 +6004,9 @@ def _render_track_view(
                     track_assignment_meta = track.get("assignment") if isinstance(track.get("assignment"), dict) else {}
                     break
 
-        if assigned_cast_id:
+        if isinstance(assignment_meta, dict) and assignment_meta.get("unassigned"):
+            st.caption(":orange[🚫 Cast unassigned (manual override)]")
+        elif assigned_cast_id:
             cast_name = cast_options.get(assigned_cast_id) if cast_options else None
             st.caption(f"🎭 Assigned cast: **{cast_name or assigned_cast_id}**")
             if track_assignment_meta.get("assignment_type") == "track_override":

@@ -10,6 +10,7 @@ from apps.api.services.assignment_resolver import (
     resolve_face_assignment,
     resolve_track_assignment,
 )
+from apps.api.services.people import PeopleService
 from py_screenalytics import run_layout
 
 RUN_ID = "Attempt1_2025-02-01_000000EST"
@@ -94,3 +95,27 @@ def test_cluster_assignment_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path
     second_timestamp = state_two["cluster_assignments_raw"]["c1"]["updated_at"]
 
     assert first_timestamp == second_timestamp
+
+
+def test_unassign_overrides_inferred_cast(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "demo-show-s01e12"
+    people_service = PeopleService(tmp_path)
+    person = people_service.create_person("demo-show", name="Test Person", cast_id="cast_a")
+    _write_identities(ep_id, RUN_ID, [{"identity_id": "c1", "person_id": person["person_id"]}], tmp_path)
+
+    assignment_service.set_cluster_assignment(
+        ep_id,
+        RUN_ID,
+        cluster_id="c1",
+        cast_id=None,
+    )
+
+    state = assignment_service.load_assignment_state(
+        ep_id,
+        RUN_ID,
+        include_inferred=True,
+        data_root=tmp_path,
+    )
+    assert state["cluster_assignments"]["c1"]["cast_id"] is None
+    assert state["cluster_assignments"]["c1"].get("unassigned") is True
