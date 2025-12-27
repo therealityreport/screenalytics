@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import sys
+import threading
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -35,7 +37,10 @@ from apps.api.services import assignments as assignment_service
 from apps.api.services.faces_review_bundle import build_faces_review_bundle
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.run_export import build_run_debug_bundle_zip, build_screentime_run_debug_pdf
+from apps.api.services.run_export import build_run_debug_bundle_zip
+from apps.api.services.jobs import JobService
+from apps.api.services.run_state import compute_params_hash, run_state_service
+from apps.api.services.run_validator import validate_run_integrity
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -48,6 +53,7 @@ from apps.api.services.storage import (
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
+JOB_SERVICE = JobService()
 LOGGER = logging.getLogger(__name__)
 
 DIAG = os.getenv("DIAG_LOG", "0") == "1"
@@ -2497,6 +2503,216 @@ def export_run_debug_bundle(
             media_type="application/pdf",
             headers=headers,
         )
+
+
+class RunStageJobRequest(BaseModel):
+    params: Dict[str, Any] | None = Field(
+        default=None,
+        description="Optional stage parameters for job execution.",
+    )
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/state", tags=["episodes"])
+def get_run_processing_state(
+    ep_id: str,
+    run_id: str,
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return run_state_service.get_state(ep_id=ep_id_norm, run_id=run_id_norm)
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/integrity", tags=["episodes"])
+def get_run_integrity(
+    ep_id: str,
+    run_id: str,
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return validate_run_integrity(ep_id_norm, run_id_norm)
+
+
+@router.post("/episodes/{ep_id}/runs/{run_id}/jobs/{stage}", tags=["episodes"])
+def trigger_run_stage_job(
+    ep_id: str,
+    run_id: str,
+    stage: str,
+    payload: RunStageJobRequest = Body(default=RunStageJobRequest()),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    stage_norm = (stage or "").strip().lower()
+    allowed_stages = {"detect_track", "faces_embed", "cluster", "screentime", "export"}
+    if stage_norm not in allowed_stages:
+        raise HTTPException(status_code=422, detail=f"Unknown stage '{stage}'")
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    params = payload.params or {}
+    params_hash = compute_params_hash(params)
+    existing = run_state_service.current_stage_entry(
+        ep_id=ep_id_norm,
+        run_id=run_id_norm,
+        stage=stage_norm,
+    )
+    if existing and params_hash and existing.get("params_hash") == params_hash:
+        if existing.get("state") in {"queued", "running", "done"}:
+            return {
+                "status": "existing",
+                "ep_id": ep_id_norm,
+                "run_id": run_id_norm,
+                "stage": stage_norm,
+                "state": existing.get("state"),
+                "job_id": existing.get("job_id"),
+                "params_hash": existing.get("params_hash"),
+            }
+
+    run_state_service.update_stage(
+        ep_id=ep_id_norm,
+        run_id=run_id_norm,
+        stage=stage_norm,
+        state="queued",
+        progress=0.0,
+        params=params,
+        params_hash=params_hash,
+        source="api",
+    )
+
+    job_id: str | None = None
+    try:
+        if stage_norm == "detect_track":
+            from apps.api.tasks import run_detect_track_task
+
+            options = dict(params)
+            options["run_id"] = run_id_norm
+            result = run_detect_track_task.delay(ep_id_norm, options)
+            job_id = getattr(result, "id", None)
+        elif stage_norm == "faces_embed":
+            from apps.api.tasks import run_faces_embed_task
+
+            options = dict(params)
+            options["run_id"] = run_id_norm
+            result = run_faces_embed_task.delay(ep_id_norm, options)
+            job_id = getattr(result, "id", None)
+        elif stage_norm == "cluster":
+            from apps.api.tasks import run_cluster_task
+
+            options = dict(params)
+            options["run_id"] = run_id_norm
+            result = run_cluster_task.delay(ep_id_norm, options)
+            job_id = getattr(result, "id", None)
+        elif stage_norm == "screentime":
+            record = JOB_SERVICE.start_screen_time_job(
+                ep_id=ep_id_norm,
+                run_id=run_id_norm,
+                quality_min=params.get("quality_min"),
+                gap_tolerance_s=params.get("gap_tolerance_s"),
+                use_video_decode=params.get("use_video_decode"),
+                screen_time_mode=params.get("screen_time_mode"),
+                edge_padding_s=params.get("edge_padding_s"),
+                track_coverage_min=params.get("track_coverage_min"),
+                preset=params.get("preset"),
+            )
+            job_id = record.get("job_id")
+        elif stage_norm == "export":
+            job_id = uuid.uuid4().hex
+            export_format = str(params.get("format", "pdf")).lower()
+
+            def _export_worker() -> None:
+                try:
+                    run_state_service.update_stage(
+                        ep_id=ep_id_norm,
+                        run_id=run_id_norm,
+                        stage="export",
+                        state="running",
+                        progress=0.0,
+                        job_id=job_id,
+                        params=params,
+                        source="api",
+                    )
+                    if export_format == "zip":
+                        build_run_debug_bundle_zip(ep_id=ep_id_norm, run_id=run_id_norm)
+                    else:
+                        from apps.api.services.run_export import generate_run_debug_pdf
+
+                        generate_run_debug_pdf(ep_id_norm, run_id_norm)
+                    run_state_service.update_stage(
+                        ep_id=ep_id_norm,
+                        run_id=run_id_norm,
+                        stage="export",
+                        state="done",
+                        progress=1.0,
+                        job_id=job_id,
+                        params=params,
+                        source="api",
+                    )
+                except Exception as exc:
+                    run_state_service.update_stage(
+                        ep_id=ep_id_norm,
+                        run_id=run_id_norm,
+                        stage="export",
+                        state="failed",
+                        last_error=str(exc),
+                        job_id=job_id,
+                        params=params,
+                        source="api",
+                    )
+
+            thread = threading.Thread(target=_export_worker, name=f"run-export-{job_id}", daemon=True)
+            thread.start()
+    except FileNotFoundError as exc:
+        run_state_service.update_stage(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            stage=stage_norm,
+            state="failed",
+            last_error=str(exc),
+            params=params,
+            params_hash=params_hash,
+            source="api",
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        run_state_service.update_stage(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            stage=stage_norm,
+            state="failed",
+            last_error=str(exc),
+            params=params,
+            params_hash=params_hash,
+            source="api",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if job_id and stage_norm in {"detect_track", "faces_embed", "cluster"}:
+        run_state_service.update_stage(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            stage=stage_norm,
+            state="queued",
+            progress=0.0,
+            job_id=job_id,
+            params=params,
+            params_hash=params_hash,
+            source="api",
+        )
+
+    return {
+        "status": "queued",
+        "ep_id": ep_id_norm,
+        "run_id": run_id_norm,
+        "stage": stage_norm,
+        "job_id": job_id,
+        "params_hash": params_hash,
+    }
 
 
 @router.get(

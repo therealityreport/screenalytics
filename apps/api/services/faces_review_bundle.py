@@ -16,6 +16,8 @@ from apps.api.services.cast import CastService
 from apps.api.services.grouping import GroupingService
 from apps.api.services.identities import cluster_track_summary, load_identities
 from apps.api.services.people import PeopleService
+from apps.api.services.run_state import run_state_service
+from apps.api.services.run_validator import validate_run_integrity
 
 LOGGER = logging.getLogger(__name__)
 
@@ -405,6 +407,21 @@ def build_faces_review_bundle(
 
     cast_gallery_cards.sort(key=lambda card: (card.get("cast", {}).get("name") or "").lower())
 
+    run_state_payload: Dict[str, Any] | None = None
+    status_snapshot: Dict[str, Any] | None = None
+    validation_payload: Dict[str, Any] | None = None
+    if run_id_norm:
+        try:
+            run_state_bundle = run_state_service.get_state(ep_id=ep_id, run_id=run_id_norm)
+            run_state_payload = run_state_bundle.get("run_state") if isinstance(run_state_bundle, dict) else None
+            status_snapshot = run_state_bundle.get("status_snapshot") if isinstance(run_state_bundle, dict) else None
+        except Exception as exc:
+            LOGGER.debug("[faces-review-bundle] run_state unavailable for %s/%s: %s", ep_id, run_id_norm, exc)
+        try:
+            validation_payload = validate_run_integrity(ep_id, run_id_norm, data_root=data_root)
+        except Exception as exc:
+            LOGGER.debug("[faces-review-bundle] validator unavailable for %s/%s: %s", ep_id, run_id_norm, exc)
+
     return {
         "ep_id": ep_id,
         "run_id": run_id_norm or "legacy",
@@ -422,6 +439,9 @@ def build_faces_review_bundle(
             "faces": assignment_state.get("face_exclusions", {}),
             "summary": assignment_state.get("summary", {}),
         },
+        "run_state": run_state_payload,
+        "status_snapshot": status_snapshot,
+        "validation": validation_payload,
         "cluster_payload": cluster_payload,
         "identities": identities_payload,
     }
