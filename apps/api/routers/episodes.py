@@ -3450,14 +3450,15 @@ def get_episode_assignments(
     ep_id: str,
     run_id: str = Query(..., description="Run id scope (required)"),
 ) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
     try:
         run_id_norm = run_layout.normalize_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    state = assignment_service.load_assignment_state(ep_id, run_id_norm, include_inferred=False)
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
     return {
-        "ep_id": ep_id,
+        "ep_id": ep_id_norm,
         "run_id": run_id_norm,
         "assignments": {
             "clusters": state.get("cluster_assignments_raw", {}),
@@ -3475,13 +3476,14 @@ def set_cluster_assignment(
     body: ClusterAssignmentRequest,
     run_id: str = Query(..., description="Run id scope (required)"),
 ) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
     try:
         run_id_norm = run_layout.normalize_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         assignment_service.set_cluster_assignment(
-            ep_id,
+            ep_id_norm,
             run_id_norm,
             cluster_id=body.cluster_id,
             cast_id=body.cast_id,
@@ -3491,9 +3493,9 @@ def set_cluster_assignment(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    state = assignment_service.load_assignment_state(ep_id, run_id_norm, include_inferred=False)
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
     return {
-        "ep_id": ep_id,
+        "ep_id": ep_id_norm,
         "run_id": run_id_norm,
         "assignments": {
             "clusters": state.get("cluster_assignments_raw", {}),
@@ -3511,13 +3513,14 @@ def set_track_assignment(
     body: TrackOverrideRequest,
     run_id: str = Query(..., description="Run id scope (required)"),
 ) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
     try:
         run_id_norm = run_layout.normalize_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         assignment_service.set_track_override(
-            ep_id,
+            ep_id_norm,
             run_id_norm,
             track_id=body.track_id,
             cast_id=body.cast_id,
@@ -3527,9 +3530,9 @@ def set_track_assignment(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    state = assignment_service.load_assignment_state(ep_id, run_id_norm, include_inferred=False)
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
     return {
-        "ep_id": ep_id,
+        "ep_id": ep_id_norm,
         "run_id": run_id_norm,
         "assignments": {
             "clusters": state.get("cluster_assignments_raw", {}),
@@ -3547,13 +3550,14 @@ def set_face_exclusion(
     body: FaceExclusionRequest,
     run_id: str = Query(..., description="Run id scope (required)"),
 ) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
     try:
         run_id_norm = run_layout.normalize_run_id(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         assignment_service.set_face_exclusion(
-            ep_id,
+            ep_id_norm,
             run_id_norm,
             face_id=body.face_id,
             excluded=body.excluded,
@@ -3565,9 +3569,9 @@ def set_face_exclusion(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    state = assignment_service.load_assignment_state(ep_id, run_id_norm, include_inferred=False)
+    state = assignment_service.load_assignment_state(ep_id_norm, run_id_norm, include_inferred=False)
     return {
-        "ep_id": ep_id,
+        "ep_id": ep_id_norm,
         "run_id": run_id_norm,
         "assignments": {
             "clusters": state.get("cluster_assignments_raw", {}),
