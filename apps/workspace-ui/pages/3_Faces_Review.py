@@ -1176,6 +1176,14 @@ def _refresh_roster_names(show: str | None) -> None:
     _roster_cache().pop(show, None)
 
 
+def _focus_cast_members(cast_id: str | None, cast_name: str | None = None) -> None:
+    """Switch to Cast Members view and focus on a cast member after assignment."""
+    _set_view("people")
+    if cast_id:
+        st.session_state["filter_cast_id"] = cast_id
+        st.session_state["filter_cast_name"] = cast_name or cast_id
+
+
 def _name_choice_widget(
     *,
     label: str,
@@ -1233,6 +1241,8 @@ def _assign_track_name(ep_id: str, track_id: int, name: str, show: str | None, c
         st.session_state["selected_identity"] = new_identity_id
     _refresh_roster_names(show)
     _invalidate_assignment_caches()  # Clear cached data so UI reflects changes immediately
+    if cast_id:
+        _focus_cast_members(cast_id, cleaned)
     st.rerun()
 
 
@@ -1272,6 +1282,8 @@ def _bulk_assign_tracks(
         if key.startswith("bulk_track_sel::"):
             st.session_state[key] = set()
     _refresh_roster_names(show)
+    if cast_id:
+        _focus_cast_members(cast_id, cleaned)
     st.rerun()
 
 
@@ -3466,6 +3478,7 @@ def _render_unassigned_cluster_card(
                         if resp and resp.get("status") == "success":
                             _invalidate_assignment_caches()
                             st.success(f"Assigned cluster to {sugg_name}!")
+                            _focus_cast_members(sugg_cast_id, sugg_name)
                             st.rerun()
                         else:
                             st.error("Failed to assign cluster. Check logs.")
@@ -3531,6 +3544,7 @@ def _render_unassigned_cluster_card(
                     if resp and resp.get("status") == "success":
                         _invalidate_assignment_caches()
                         st.success(f"Assigned cluster to {suggested_cast_name}!")
+                        _focus_cast_members(suggested_cast_id, suggested_cast_name)
                         st.rerun()
                     else:
                         st.error("Failed to assign cluster. Check logs.")
@@ -3590,6 +3604,7 @@ def _render_unassigned_cluster_card(
                                 if resp and resp.get("status") == "success":
                                     _invalidate_assignment_caches()
                                     st.success(f"Assigned cluster to {cast_options.get(selected_cast_id, 'cast member')}!")
+                                    _focus_cast_members(selected_cast_id, cast_options.get(selected_cast_id))
                                     st.rerun()
                                 else:
                                     st.error("Failed to assign cluster. Check logs.")
@@ -3977,6 +3992,7 @@ def _assign_cluster_to_cast(ep_id: str, show_id: str, cluster_id: str, cast_id: 
         target_person = next((p for p in people if p.get("cast_id") == cast_id), None)
         target_person_id = target_person.get("person_id") if target_person else None
 
+        cast_name: str | None = None
         if not target_person_id:
             cast_resp = _fetch_cast_cached(show_id)
             cast_members = cast_resp.get("cast", []) if cast_resp else []
@@ -3984,6 +4000,7 @@ def _assign_cluster_to_cast(ep_id: str, show_id: str, cluster_id: str, cast_id: 
             if not cast_member:
                 st.error(f"Cast member {cast_id} not found.")
                 return False
+            cast_name = cast_member.get("name")
             create_payload = {
                 "name": cast_member.get("name"),
                 "cast_id": cast_id,
@@ -3994,6 +4011,8 @@ def _assign_cluster_to_cast(ep_id: str, show_id: str, cluster_id: str, cast_id: 
                 st.error("Failed to create person for this cast member.")
                 return False
             target_person_id = new_person["person_id"]
+        elif target_person:
+            cast_name = target_person.get("name")
 
         payload = {
             "strategy": "manual",
@@ -4004,6 +4023,7 @@ def _assign_cluster_to_cast(ep_id: str, show_id: str, cluster_id: str, cast_id: 
         resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
         if resp and resp.get("status") == "success":
             _invalidate_assignment_caches()
+            _focus_cast_members(cast_id, cast_name)
             return True
         st.error("Failed to assign cluster. Check logs.")
         return False
@@ -4043,6 +4063,7 @@ def _bulk_assign_clusters(
         people_resp = _fetch_people_cached(show_id)
         people = people_resp.get("people", []) if people_resp else []
         target_person = next((p for p in people if p.get("cast_id") == target_cast_id), None)
+        focus_name = target_name or (target_person.get("name") if target_person else None)
 
         # Check if source person actually exists in people.json
         source_person = next((p for p in people if p.get("person_id") == source_person_id), None)
@@ -4078,6 +4099,7 @@ def _bulk_assign_clusters(
 
             if resp and resp.get("status") == "success":
                 _invalidate_assignment_caches()
+                _focus_cast_members(target_cast_id, focus_name or target_cast_id)
                 return True
             st.error("Failed to assign clusters. Check logs for details.")
             return False
@@ -4092,6 +4114,8 @@ def _bulk_assign_clusters(
                 st.error(f"Cast member {target_cast_id} not found")
                 _debug("cast lookup failed", {"cast_id": target_cast_id})
                 return False
+            if not focus_name:
+                focus_name = cast_member.get("name")
 
             # Create a new person record linked to this cast member via API
             create_payload = {
@@ -4203,6 +4227,7 @@ def _bulk_assign_clusters(
 
         _debug("merge verified", {"clusters_transferred": expected_cluster_count})
         _invalidate_assignment_caches()
+        _focus_cast_members(target_cast_id, focus_name or target_cast_id)
         return True
     except Exception as exc:
         if debug_assign:
