@@ -21,12 +21,17 @@ def _create_episode(client: TestClient) -> str:
 
 
 class _FakeS3Storage:
+    backend = "s3"
+    bucket = "screenalytics"
+    _client = object()
+    init_error = None
+
     def video_object_key_v2(self, show_slug: str, season: int, episode: int) -> str:
         return f"raw/videos/{show_slug}/s{season:02d}/e{episode:02d}/episode.mp4"
 
-    def presign_episode_video(self, ep_id: str, **_) -> PresignedUpload:
+    def presign_episode_video(self, ep_id: str, *, object_key: str, **_) -> PresignedUpload:
         bucket = os.getenv("AWS_S3_BUCKET", "screenalytics")
-        key = f"raw/videos/{ep_id}/episode.mp4"
+        key = object_key
         return PresignedUpload(
             ep_id=ep_id,
             bucket=bucket,
@@ -46,12 +51,8 @@ def test_presign_matrix_local(monkeypatch, tmp_path):
     ep_id = _create_episode(client)
 
     resp = client.post(f"/episodes/{ep_id}/assets")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["method"] == "FILE"
-    assert data["bucket"] == "local"
-    assert data["key"].startswith("videos/")
-    assert data["path"].endswith("episode.mp4")
+    assert resp.status_code == 503
+    assert "S3 misconfigured" in resp.json().get("message", "")
 
 
 def test_presign_matrix_s3(monkeypatch, tmp_path):

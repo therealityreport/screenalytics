@@ -4,15 +4,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+from apps.api.routers import episodes as episodes_router
 from py_screenalytics import run_layout
-from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
-    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("STORAGE_BACKEND", "s3")
     return data_root
 
 
@@ -23,16 +23,21 @@ def _write_jsonl(path, rows) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
-def test_track_frames_include_other_tracks_hint(tmp_path):
+class _FakeStorage:
+    backend = "s3"
+    bucket = "demo-bucket"
+    _client = object()
+    init_error = None
+
+    def presign_get(self, key: str, expires_in: int = 3600, content_type: str | None = None) -> str:
+        return f"https://example.com/{key}"
+
+
+def test_track_frames_include_other_tracks_hint(tmp_path, monkeypatch):
     client = TestClient(app)
     ep_id = "demo-s01e03"
     run_id = "run-frames-other-1"
-    ensure_dirs(ep_id)
-    frames_root = get_path(ep_id, "frames_root")
-    crop_dir = frames_root / "crops" / "track_0001"
-    crop_dir.mkdir(parents=True, exist_ok=True)
-    crop_path = crop_dir / "frame_000010.jpg"
-    crop_path.write_bytes(b"x")
+    monkeypatch.setattr(episodes_router, "STORAGE", _FakeStorage())
 
     manifests_dir = run_layout.run_root(ep_id, run_id)
     manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +54,7 @@ def test_track_frames_include_other_tracks_hint(tmp_path):
                 "ts": 1.0,
                 "conf": 0.9,
                 "bbox": [0, 0, 10, 10],
-                "crop_rel_path": "crops/track_0001/frame_000010.jpg",
+                "crop_s3_key": "artifacts/crops/demo-s01e03/track_0001/frame_000010.jpg",
             },
             {
                 # Second face in the same frame belongs to a different track
@@ -66,7 +71,12 @@ def test_track_frames_include_other_tracks_hint(tmp_path):
     _write_jsonl(
         tracks_path,
         [
-            {"track_id": 1, "frame_count": 1, "faces_count": 1, "best_crop_rel_path": "crops/track_0001/frame_000010.jpg"},
+            {
+                "track_id": 1,
+                "frame_count": 1,
+                "faces_count": 1,
+                "best_crop_s3_key": "artifacts/crops/demo-s01e03/track_0001/frame_000010.jpg",
+            },
             {"track_id": 2, "frame_count": 1, "faces_count": 1},
         ],
     )

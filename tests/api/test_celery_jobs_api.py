@@ -13,7 +13,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-pytest.importorskip("celery")
 
 
 @pytest.fixture

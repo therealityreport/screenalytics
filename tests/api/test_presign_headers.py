@@ -8,16 +8,20 @@ from apps.api.services.storage import PresignedUpload, StorageService
 class _FakeStorage:
     def __init__(self) -> None:
         self._calls = []
+        self.backend = "s3"
+        self._client = object()
+        self.bucket = "screenalytics"
+        self.init_error = None
 
     def video_object_key_v2(self, show_slug: str, season: int, episode: int) -> str:
         return f"raw/videos/{show_slug}/s{season:02d}/e{episode:02d}/episode.mp4"
 
-    def presign_episode_video(self, ep_id: str, **_) -> PresignedUpload:
+    def presign_episode_video(self, ep_id: str, *, object_key: str, **_) -> PresignedUpload:
         self._calls.append(ep_id)
         return PresignedUpload(
             ep_id=ep_id,
             bucket="screenalytics",
-            object_key=f"raw/videos/{ep_id}/episode.mp4",
+            object_key=object_key,
             upload_url="https://storage/upload",
             expires_in=900,
             headers={"Content-Type": "video/mp4"},
@@ -46,13 +50,8 @@ def test_presign_returns_file_path_for_local(monkeypatch, tmp_path):
     ep_id = _create_episode(client)
 
     resp = client.post(f"/episodes/{ep_id}/assets")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["method"] == "FILE"
-    assert data["bucket"] == "local"
-    assert data["key"].startswith("videos/")
-    assert data["path"].endswith("episode.mp4")
-    assert data["path"]
+    assert resp.status_code == 503
+    assert "S3 misconfigured" in resp.json().get("message", "")
 
 
 def test_presign_put_headers(monkeypatch, tmp_path):
