@@ -2319,7 +2319,15 @@ class GroupingService:
         show_id = parsed["show"]
 
         # Load centroids with validation using helper
-        centroids_data = self.load_cluster_centroids(ep_id)
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            LOGGER.warning(
+                "[%s] cluster_centroids.json missing/corrupt for manual assignment; recomputing (%s)",
+                ep_id,
+                exc,
+            )
+            centroids_data = self.compute_cluster_centroids(ep_id)
         centroids_map_full = _normalize_centroids_to_map(centroids_data.get("centroids", {}), validate=True)
         centroids_map = {cid: data["centroid"] for cid, data in centroids_map_full.items()}
 
