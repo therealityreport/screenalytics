@@ -195,6 +195,118 @@ Response (shape returned by handler)
 
 ---
 
+## Run-Scoped Pipeline + Faces Review Surface Area
+
+This section maps the endpoints used by Detect/Track → Faces Embed → Cluster → Validator → Assignments → Screentime.
+
+### Common IDs
+
+- `ep_id`: Episode ID (e.g., `rhoslc-s06e11`)
+- `run_id`: Run attempt ID (e.g., `Attempt3_2025-01-01_123456EST`)
+- `track_id`: Track identifier (int)
+- `identity_id`/`cluster_id`: Cluster identity ID
+- `face_id`: Face record ID
+- `cast_id`: Cast identity ID
+- `job_id`: Async job handle
+
+### Detect/Track Output (detections + tracks + track metrics)
+
+Artifacts (run-scoped):
+- `data/manifests/{ep_id}/runs/{run_id}/detections.jsonl`
+- `data/manifests/{ep_id}/runs/{run_id}/tracks.jsonl`
+- `data/manifests/{ep_id}/runs/{run_id}/track_metrics.json`
+- `data/manifests/{ep_id}/runs/{run_id}/detect_track.json` (marker)
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `POST /jobs/detect_track` | Sync detect+track pipeline | artifacts above | episode video | `ep_id`, optional `run_id` |
+| `POST /jobs/detect_track_async` | Async detect+track (JobService) | artifacts above | episode video | `ep_id`, optional `run_id`, `job_id` |
+| `POST /celery_jobs/detect_track` | Celery/local detect+track (streaming logs) | artifacts above | episode video | `ep_id`, optional `run_id`, `job_id` |
+| `POST /episodes/{ep_id}/runs/{run_id}/jobs/detect_track` | Run-scoped trigger | artifacts above | episode video | `ep_id`, `run_id`, `job_id` |
+| `GET /episodes/{ep_id}/status?run_id=...` | Stage readiness/status | none | run markers + manifests | `ep_id`, `run_id` |
+| `GET /episodes/{ep_id}/runs/{run_id}/state` | Run state + artifact pointers | none | DB run_state + filesystem | `ep_id`, `run_id` |
+
+### Crop/Embed Output (faces manifest + embeddings + crops)
+
+Artifacts (run-scoped):
+- `data/manifests/{ep_id}/runs/{run_id}/faces.jsonl`
+- `data/embeds/{ep_id}/runs/{run_id}/faces.npy`
+- `data/frames/{ep_id}/runs/{run_id}/crops/track_####/frame_######.jpg`
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `POST /jobs/faces_embed` | Sync faces embed/harvest | artifacts above | tracks/detections | `ep_id`, optional `run_id` |
+| `POST /jobs/faces_embed_async` | Async faces embed (JobService) | artifacts above | tracks/detections | `ep_id`, optional `run_id`, `job_id` |
+| `POST /celery_jobs/faces_embed` | Celery/local faces embed (streaming logs) | artifacts above | tracks/detections | `ep_id`, optional `run_id`, `job_id` |
+| `POST /episodes/{ep_id}/runs/{run_id}/jobs/faces_embed` | Run-scoped trigger | artifacts above | tracks/detections | `ep_id`, `run_id`, `job_id` |
+| `GET /episodes/{ep_id}/tracks/{track_id}/crops` | Track crop browser | none | crops on disk/S3 | `ep_id`, `track_id` |
+| `GET /episodes/{ep_id}/tracks/{track_id}/integrity` | Track faces vs crops integrity | none | faces.jsonl + crops | `ep_id`, `track_id` |
+
+### Cluster Output (identities + reps + membership)
+
+Artifacts (run-scoped):
+- `data/manifests/{ep_id}/runs/{run_id}/identities.json`
+- `data/manifests/{ep_id}/runs/{run_id}/cluster_centroids.json`
+- `data/manifests/{ep_id}/runs/{run_id}/track_reps.jsonl`
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `POST /jobs/cluster` | Sync clustering pipeline | artifacts above | faces + embeddings | `ep_id`, optional `run_id` |
+| `POST /jobs/cluster_async` | Async clustering (JobService) | artifacts above | faces + embeddings | `ep_id`, optional `run_id`, `job_id` |
+| `POST /celery_jobs/cluster` | Celery/local clustering (streaming logs) | artifacts above | faces + embeddings | `ep_id`, optional `run_id`, `job_id` |
+| `POST /episodes/{ep_id}/runs/{run_id}/jobs/cluster` | Run-scoped trigger | artifacts above | faces + embeddings | `ep_id`, `run_id`, `job_id` |
+| `GET /episodes/{ep_id}/cluster_tracks?run_id=...` | Cluster↔track summary | none | identities + tracks (+ faces count) | `ep_id`, `run_id` |
+| `GET /episodes/{ep_id}/faces_review_bundle?run_id=...` | Faces Review bundle | none | identities + tracks + reps | `ep_id`, `run_id` |
+
+### Validator Output (Run Health panel)
+
+Computed on demand (no artifact written).
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `GET /episodes/{ep_id}/runs/{run_id}/integrity` | Validator report | none | run artifacts + run_state pointers | `ep_id`, `run_id` |
+| `GET /episodes/{ep_id}/runs/{run_id}/state` | Run state + artifact pointers | none | DB run_state + filesystem | `ep_id`, `run_id` |
+| `GET /episodes/{ep_id}/faces_review_bundle?run_id=...` | Bundle includes validator | none | validator + artifacts | `ep_id`, `run_id` |
+
+### Assignments/Corrections (run-scoped canonical store)
+
+Stored in `data/manifests/{ep_id}/runs/{run_id}/identities.json` under:
+`manual_assignments`, `track_overrides`, `face_exclusions`.
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `GET /episodes/{ep_id}/assignments?run_id=...` | Read assignment state | none | identities.json | `ep_id`, `run_id` |
+| `POST/PUT /episodes/{ep_id}/assignments/cluster` | Cluster→cast assignment | manual_assignments | identities.json | `ep_id`, `run_id`, `cluster_id`, `cast_id` |
+| `POST/PUT /episodes/{ep_id}/assignments/track` | Track override | track_overrides | identities.json | `ep_id`, `run_id`, `track_id`, `cast_id` |
+| `POST/PUT /episodes/{ep_id}/assignments/face_exclusion` | Face exclusion | face_exclusions | identities.json | `ep_id`, `run_id`, `face_id` |
+
+### Screentime Compute (run-scoped)
+
+Artifacts (run-scoped):
+- `data/manifests/{ep_id}/runs/{run_id}/analytics/screentime.json`
+- `data/manifests/{ep_id}/runs/{run_id}/analytics/screentime.csv`
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `POST /jobs/screen_time/analyze` | Run screentime analysis | screentime.json/csv | faces + tracks + identities + assignments | `ep_id`, optional `run_id`, `job_id` |
+| `POST /episodes/{ep_id}/runs/{run_id}/jobs/screentime` | Run-scoped trigger | screentime.json/csv | faces + tracks + identities + assignments | `ep_id`, `run_id`, `job_id` |
+| `GET /jobs?ep_id=...&job_type=screen_time_analyze` | Job history | none | job store | `ep_id` |
+| `GET /jobs/{job_id}/progress` | Job progress | none | job store | `job_id` |
+
+### Screentime UI (Screen Time Analytics Page)
+
+The Streamlit page currently reads legacy analytics paths:
+- `data/analytics/{ep_id}/screentime.json`
+- `data/analytics/{ep_id}/screentime.csv`
+
+| Endpoint | Appears to be | Creates / writes | Reads / uses | IDs |
+| --- | --- | --- | --- | --- |
+| `POST /jobs/screen_time/analyze` | Launch screentime job | screentime.json/csv | faces + tracks + identities + assignments | `ep_id`, optional `run_id` |
+| `GET /jobs?ep_id=...&job_type=screen_time_analyze` | Job history | none | job store | `ep_id` |
+| `GET /jobs/{job_id}/progress` | Job progress | none | job store | `job_id` |
+
+---
+
 ### Audio (`apps/api/routers/audio.py`, mounted at `/audio`)
 
 The audio pipeline is optional and depends on external tooling/credentials.
